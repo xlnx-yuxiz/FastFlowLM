@@ -24,6 +24,7 @@
 #include <chrono>
 #include <thread>
 #include <vector>
+#include <utility>
 #include "wstream_buf.hpp"
 #include "program_args.hpp"
 #include "streaming_ostream.hpp"
@@ -48,7 +49,10 @@ extern std::atomic<bool> g_npu_in_use;
 extern std::atomic<int> g_npu_active_requests;
 
 // Helper function to check if an endpoint requires NPU access
-bool requires_npu_access(const std::string& method, const std::string& path);
+bool requires_npu_access(const std::string& method,
+                         const std::string& path,
+                         const nlohmann::json& request,
+                         const std::string& default_backend);
 
 ///@brief get current time string, format: hh:mm:ss mm:dd:yyyy
 ///@return the current time string
@@ -117,6 +121,7 @@ public:
     void set_request_timeout(std::chrono::seconds timeout) { request_timeout_ = timeout; }
     void set_io_threads(size_t num_threads) { io_thread_count_ = num_threads; }
     void set_npu_queue_length(size_t q_len) { max_npu_queue_ = q_len; }
+    void set_default_backend(std::string backend) { default_backend_ = std::move(backend); }
     // Maximum accepted HTTP request body size (in bytes)
     void set_max_body_size_bytes(std::size_t bytes) { max_body_size_bytes_ = bytes; }
     std::size_t get_max_body_size_bytes() const { return max_body_size_bytes_; }
@@ -162,6 +167,7 @@ private:
     size_t io_thread_count_ = 5;
     std::size_t max_body_size_bytes_ = 256ull * 1024 * 1024; // 256 MB default
     size_t max_npu_queue_ = 10;
+    std::string default_backend_;
 
     // Request tracking
     mutable std::mutex active_requests_mutex_;

@@ -3675,7 +3675,7 @@
             "path": "vision_weights.q4nx"
         }
     ],
-    "hy-mt2:1.8b": [
+    "hy-mt2-flash:1.8b": [
         {
             "type": "file",
             "oid": "2ace5b8c3964855369daf18f16907dfdba648708",

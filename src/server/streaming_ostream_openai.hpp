@@ -36,7 +36,7 @@ class streaming_buf_openai : public std::streambuf {
 public:
     ///@brief StreamCallback
     using StreamCallback = std::function<void(const std::string&, bool)>;
-    
+
     streaming_buf_openai(const std::string& model, StreamCallback callback)
         : model_name(model), stream_callback(callback), first_chunk(true) {
         // Generate a unique ID for this stream
@@ -55,7 +55,7 @@ protected:
         }
         return ch;
     }
-    
+
     ///@brief Called when stream is flushed
     ///@return 0
     int sync() override {
@@ -73,7 +73,7 @@ public:
         }
         send_final_response(meta_info);
     }
- 
+
 
 private:
     ///@brief Generate a unique stream ID
@@ -81,7 +81,7 @@ private:
         std::random_device rd;
         std::mt19937 gen(rd());
         std::uniform_int_distribution<> dis(0, 15);
-        
+
         std::stringstream ss;
         ss << "chatcmpl-";
         for (int i = 0; i < 24; ++i) {
@@ -122,54 +122,54 @@ private:
         }
         return 0; // Invalid UTF-8 start byte
     }
-    
+
     ///@brief Flush only complete UTF-8 sequences
     ///@param is_final the is final
     void flush_complete_utf8_sequences(bool is_final) {
         if (buffer.empty()) return;
-        
+
         std::string complete_content;
         size_t pos = 0;
-        
+
         // Process complete UTF-8 sequences
         while (pos < buffer.size()) {
             unsigned char first = static_cast<unsigned char>(buffer[pos]);
             size_t seq_len = get_utf8_sequence_length(first);
-            
+
             if (seq_len == 0) {
                 // Invalid UTF-8 start byte, skip it
                 pos++;
                 continue;
             }
-            
+
             // Check if we have a complete sequence
             if (pos + seq_len > buffer.size()) {
                 // Incomplete sequence, stop here
                 break;
             }
-            
+
             // Add complete sequence to output
             complete_content.append(buffer, pos, seq_len);
             pos += seq_len;
         }
-        
+
         // Send complete sequences if any
         if (!complete_content.empty()) {
             send_response(complete_content, is_final);
         }
-        
+
         // Remove processed bytes from buffer
         if (pos > 0) {
             buffer.erase(0, pos);
         }
     }
-    
+
     ///@brief Send the response
     ///@param content the content
     ///@param is_final the is final
     void send_response(const std::string& content, bool is_final) {
         json response;
-        
+
         // Content chunk
         response = {
             {"id", stream_id},
@@ -186,9 +186,9 @@ private:
                 }
             })}
         };
-        
+
         stream_callback("data: " + response.dump() + "\n\n", is_final);
-      
+
     }
 
     ///@brief Send the chat final response
@@ -207,6 +207,7 @@ private:
             })},
             {"usage", {
                 {"prompt_tokens", meta_info.prompt_tokens},
+                {"prompt_tokens_details", {{"cached_tokens", meta_info.cached_prompt_tokens}}},
                 {"completion_tokens", meta_info.generated_tokens},
                 {"total_tokens", meta_info.prompt_tokens + meta_info.generated_tokens}
             }}
@@ -215,7 +216,7 @@ private:
         // Send the [DONE] message
         stream_callback("data: [DONE]\n\n", true);
     }
-    
+
 
     ///@brief Buffer
     std::string buffer;
@@ -240,7 +241,7 @@ class streaming_ostream_openai : public std::ostream {
 public:
     streaming_ostream_openai(const std::string& model, streaming_buf_openai::StreamCallback callback)
         : std::ostream(&buf), buf(model, callback) {}
-    
+
     ///@brief Finalize the chat
     void finalize(chat_meta_info_t& meta_info) {
         buf.finalize(meta_info);
@@ -265,8 +266,15 @@ public:
     ///@brief StreamCallback
     using StreamCallback = std::function<void(const std::string&, bool)>;
 
-    streaming_buf_openai_chat(const std::string& model, AutoModel* auto_chat_engine, StreamCallback callback)
-        : model_name(model), auto_chat_engine(auto_chat_engine), stream_callback(callback), first_chunk(true) {
+    streaming_buf_openai_chat(const std::string& model,
+                              AutoModel* auto_chat_engine,
+                              StreamCallback callback,
+                              bool allow_tool_calls = true)
+        : model_name(model),
+          auto_chat_engine(auto_chat_engine),
+          stream_callback(callback),
+          first_chunk(true),
+          allow_tool_calls(allow_tool_calls) {
         // Generate a unique ID for this stream
         generate_stream_id();
         generate_created();
@@ -303,11 +311,19 @@ public:
         else {
             send_response("", false, true);
         }
+        for (int drain_attempt = 0; drain_attempt < 1024; ++drain_attempt) {
+            if (!send_response("", false, true)) {
+                break;
+            }
+        }
         // Only promote to a tool-call finish reason on an otherwise clean stop;
         // length/cancel/error must win, so a truncated or aborted generation is
         // never reported to the client as a complete tool call.
         if (stream_stop_reason == stop_reason_t::TOOL_DETECTED
             && meta_info.stop_reason == stop_reason_t::EOT_DETECTED) {
+            meta_info.stop_reason = stream_stop_reason;
+        }
+        if (stream_stop_reason == stop_reason_t::ERROR_DETECTED) {
             meta_info.stop_reason = stream_stop_reason;
         }
         send_final_response(meta_info);
@@ -416,27 +432,46 @@ private:
     ///@brief Send the response
     ///@param content the content
     ///@param is_final the is final
-    void send_response(const std::string& content, bool is_final, bool parser_final = false) {
+    bool send_response(const std::string& content, bool is_final, bool parser_final = false) {
+        if (stream_stop_reason == stop_reason_t::ERROR_DETECTED) {
+            return false;
+        }
         json response;
 
         StreamResult result = parser_final
             ? auto_chat_engine->parse_stream_content_final(content)
             : auto_chat_engine->parse_stream_content(content);
         if (result.type == StreamEventType::WAITING) {
-            return;
+            return false;
         }
         json delta;
         if (result.type == StreamEventType::TOOL_DONE) {
+            if (!allow_tool_calls) {
+                stream_stop_reason = stop_reason_t::ERROR_DETECTED;
+                json error_response = {
+                    {"error", {
+                        {"message", "HIP OGA model emitted a tool call even though no tools were enabled for this request."},
+                        {"type", "model_output_error"},
+                        {"code", 422}
+                    }}
+                };
+                stream_callback("data: " + error_response.dump() + "\n\n", false);
+                return true;
+            }
             stream_stop_reason = stop_reason_t::TOOL_DETECTED;
+            const int tool_call_index = index++;
+            const std::string tool_call_id = result.tool_id.empty()
+                ? stream_id + "-call-" + std::to_string(tool_call_index)
+                : result.tool_id;
             delta = {
                 {"tool_calls", json::array({
                     {
-                        {"index", index++},
-                        {"id", result.tool_id},
+                        {"index", tool_call_index},
+                        {"id", tool_call_id},
                         {"type", "function"},
                         {"function", {
                             {"name", result.tool_name},
-                            {"arguments", result.tool_args_str} 
+                            {"arguments", result.tool_args_str}
                         }}
                     }
                 })}
@@ -445,6 +480,18 @@ private:
             header_print("FLM", "Tool args: " + result.tool_args_str);
             header_print("FLM", "Tool JSON: " + delta["tool_calls"][0]["function"].dump());
         }
+        else if (result.type == StreamEventType::ERROR_EVENT) {
+            stream_stop_reason = stop_reason_t::ERROR_DETECTED;
+            json error_response = {
+                {"error", {
+                    {"message", result.error_message},
+                    {"type", "model_output_error"},
+                    {"code", 422}
+                }}
+            };
+            stream_callback("data: " + error_response.dump() + "\n\n", false);
+            return true;
+        }
         else if (result.type == StreamEventType::REASONING) {
             delta = {
                 {"role", "assistant"},
@@ -452,7 +499,7 @@ private:
             };
         }
         else if (result.type == StreamEventType::CONTENT) {
-            if (result.content.empty()) return;
+            if (result.content.empty()) return false;
 
             delta = {
                 {"role", "assistant"},
@@ -461,7 +508,7 @@ private:
         }
 
         response = {
-            {"id", stream_id}, 
+            {"id", stream_id},
             {"object", "chat.completion.chunk"},
             {"created", created},
             {"model", model_name},
@@ -475,6 +522,7 @@ private:
         };
 
         stream_callback("data: " + response.dump() + "\n\n", is_final);
+        return true;
     }
 
     ///@brief Send the chat final response
@@ -497,6 +545,7 @@ private:
             })},
             {"usage", {
                 {"prompt_tokens", meta_info.prompt_tokens},
+                {"prompt_tokens_details", {{"cached_tokens", meta_info.cached_prompt_tokens}}},
                 {"completion_tokens", meta_info.generated_tokens},
                 {"total_tokens", meta_info.prompt_tokens + meta_info.generated_tokens},
                 {"active_kv_tokens", this->auto_chat_engine->get_current_context_length()},
@@ -505,7 +554,7 @@ private:
                 {"load_duration", static_cast<double>(meta_info.load_duration) / 1'000'000'000},
                 {"prefill_duration_ttft", static_cast<double>(meta_info.prefill_duration) / 1'000'000'000},
                 {"decoding_duration", static_cast<double>(meta_info.decoding_duration) / 1'000'000'000},
-                {"prefill_speed_tps", static_cast<double>(meta_info.prompt_tokens) / static_cast<double>(meta_info.prefill_duration) * 1'000'000'000},
+                {"prefill_speed_tps", static_cast<double>(meta_info.prompt_tokens - meta_info.cached_prompt_tokens) / static_cast<double>(meta_info.prefill_duration) * 1'000'000'000},
                 {"decoding_speed_tps", static_cast<double>(meta_info.generated_tokens) / static_cast<double>(meta_info.decoding_duration) * 1'000'000'000},
             }}
         };
@@ -520,7 +569,7 @@ private:
     std::string buffer;
     ///@brief Model name
     std::string model_name;
-    ///@brief auto_chat_engine 
+    ///@brief auto_chat_engine
     AutoModel* auto_chat_engine;
     ///@brief Stream callback
     StreamCallback stream_callback;
@@ -531,6 +580,7 @@ private:
     ///@brief First chunk flag
     bool first_chunk;
     stop_reason_t stream_stop_reason = stop_reason_t::EOT_DETECTED;
+    bool allow_tool_calls = true;
     ///@brief tool_calls delta index, scoped to this stream
     int index = 0;
 
@@ -544,8 +594,11 @@ private:
 ///@return the streaming ostream
 class streaming_ostream_openai_chat : public std::ostream {
 public:
-    streaming_ostream_openai_chat(const std::string& model, AutoModel* auto_chat_engine, streaming_buf_openai_chat::StreamCallback callback)
-        : std::ostream(&buf), buf(model, auto_chat_engine, callback) {}
+    streaming_ostream_openai_chat(const std::string& model,
+                                  AutoModel* auto_chat_engine,
+                                  streaming_buf_openai_chat::StreamCallback callback,
+                                  bool allow_tool_calls = true)
+        : std::ostream(&buf), buf(model, auto_chat_engine, callback, allow_tool_calls) {}
 
     ///@brief Finalize the chat
     void finalize(chat_meta_info_t& meta_info) {
@@ -556,4 +609,3 @@ private:
     ///@brief Buffer
     streaming_buf_openai_chat buf;
 };
-

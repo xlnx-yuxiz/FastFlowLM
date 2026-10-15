@@ -16,6 +16,7 @@
 
 #include "AutoModel/automodel.hpp"
 #include "AutoModel/all_models.hpp"
+#include "backend_options.hpp"
 #include "nlohmann/json.hpp"
 #include "model_list.hpp"
 
@@ -246,7 +247,11 @@ void print_result(const BenchmarkResults_t& results) {
     std::cout << "\n";
 }
 
-BenchmarkResults_t run_benchmarks(std::string model_tag, std::string bench_config_file, model_list& availble_models, int iterations){
+BenchmarkResults_t run_benchmarks(std::string model_tag,
+                                  std::string bench_config_file,
+                                  model_list& availble_models,
+                                  int iterations,
+                                  const std::string& backend = ""){
     BenchmarkResults_t results;
     json bench_config;
     // this is used for our benchmarking, not for public use.
@@ -267,15 +272,44 @@ BenchmarkResults_t run_benchmarks(std::string model_tag, std::string bench_confi
         input_file.close();
     }
 
-    flm_rt::device npu_device_inst = flm_rt::device(0);
+    const std::string resolved_backend = flm::backend::normalize_backend(backend);
+    const bool using_hip_oga = flm::backend::is_hip_oga_backend(resolved_backend);
+    std::unique_ptr<flm_rt::device> npu_device_inst;
+    if (!using_hip_oga) {
+        npu_device_inst = std::make_unique<flm_rt::device>(0);
+    }
     std::unique_ptr<AutoModel> auto_chat_engine;
-    if (!availble_models.is_model_supported(model_tag)) {
+    const bool hip_direct_path =
+        using_hip_oga && HipOgaModel::is_model_dir(model_tag);
+    if (!hip_direct_path && !availble_models.is_model_supported(model_tag)) {
         header_print_r("ERROR", "Model not found: " << model_tag << "; Please check with `flm list` and try again.");
         return results;
     }
-    auto [new_tag, model_info] = availble_models.get_model_info(model_tag);
-    std::pair<std::string, std::unique_ptr<AutoModel>> auto_model = get_auto_model(new_tag, availble_models, &npu_device_inst);
-    auto_chat_engine = std::move(auto_model.second);
+    json model_info;
+    std::string model_path;
+    std::string resolved_model_tag = model_tag;
+    if (hip_direct_path) {
+        model_info = HipOgaModel::model_info_for_path(model_tag);
+        model_path = model_tag;
+        auto_chat_engine = std::make_unique<HipOgaModel>();
+    } else if (using_hip_oga) {
+        auto [new_tag, selected_model_info] = availble_models.get_model_info(model_tag);
+        resolved_model_tag = new_tag;
+        model_info = std::move(selected_model_info);
+        model_path = availble_models.get_hip_oga_model_path(new_tag);
+        model_info["hip_oga"]["config_path"] = model_path;
+        std::pair<std::string, std::unique_ptr<AutoModel>> auto_model =
+            get_auto_model(new_tag, availble_models, nullptr, resolved_backend);
+        auto_chat_engine = std::move(auto_model.second);
+    } else {
+        auto [new_tag, selected_model_info] = availble_models.get_model_info(model_tag);
+        resolved_model_tag = new_tag;
+        model_info = std::move(selected_model_info);
+        model_path = availble_models.get_model_path(new_tag);
+        std::pair<std::string, std::unique_ptr<AutoModel>> auto_model =
+            get_auto_model(new_tag, availble_models, npu_device_inst.get(), resolved_backend);
+        auto_chat_engine = std::move(auto_model.second);
+    }
 
     bool single_turn = model_info.contains("label") &&
         std::find(model_info["label"].begin(), model_info["label"].end(), "single-turn") != model_info["label"].end();
@@ -285,7 +319,7 @@ BenchmarkResults_t run_benchmarks(std::string model_tag, std::string bench_confi
     int max_len = bench_config["max_length"];
     if (!single_turn && max_len < 8192)
         max_len = 8192;
-    auto_chat_engine->load_model(availble_models.get_model_path(model_tag), model_info, max_len, false);
+    auto_chat_engine->load_model(model_path, model_info, max_len, false);
     std::string input_text = bench_config["input_text"];
     auto [num_tokens, benchmark_text] = auto_chat_engine->prepare_benchmark(input_text);
 
@@ -356,7 +390,7 @@ BenchmarkResults_t run_benchmarks(std::string model_tag, std::string bench_confi
     auto_chat_engine.reset();
 
     print_result(results);
-    write_bench_csv(results, new_tag, ".");
+    write_bench_csv(results, resolved_model_tag, ".");
     return results;
 }
 

@@ -48,6 +48,108 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 # ———————————————————————————————————————————————
 option(FLM_USE_HRX "Use the HRX amdxdna NPU runtime instead of XRT (0=XRT default, 1=HRX)" OFF)
 option(FLM_PORTABLE_BUILD "Build portable distribution with bundled runtime libraries" OFF)
+option(FLM_ENABLE_HIP_OGA
+       "Build the prototype ONNX Runtime GenAI backend for HIP EP/AMDGPU" OFF)
+if(FLM_HIP_OGA_ONLY)
+    message(FATAL_ERROR "FLM_HIP_OGA_ONLY was removed because it produced a run-only flm.exe without serve/check/list support. Build the normal FastFlowLM target with -DFLM_ENABLE_HIP_OGA=ON and force --backend hip at runtime.")
+endif()
+
+set(ONNXRUNTIME_GENAI_HOME "" CACHE PATH "ONNX Runtime GenAI install root")
+set(OGA_HOME "" CACHE PATH "ONNX Runtime GenAI install root alias")
+
+function(flm_find_ort_genai)
+    set(_flm_oga_roots
+        "${ONNXRUNTIME_GENAI_HOME}"
+        "${OGA_HOME}"
+        "$ENV{ONNXRUNTIME_GENAI_HOME}"
+        "$ENV{OGA_HOME}"
+        "$ENV{CONDA_PREFIX}")
+
+    find_path(ORT_GENAI_INCLUDE_DIR
+        NAMES ort_genai.h
+        HINTS ${_flm_oga_roots}
+        PATH_SUFFIXES include
+        REQUIRED)
+    find_library(ORT_GENAI_LIBRARY
+        NAMES onnxruntime-genai onnxruntime_genai
+        HINTS ${_flm_oga_roots}
+        PATH_SUFFIXES lib
+        REQUIRED)
+    set(ORT_GENAI_INCLUDE_DIR "${ORT_GENAI_INCLUDE_DIR}" PARENT_SCOPE)
+    set(ORT_GENAI_LIBRARY "${ORT_GENAI_LIBRARY}" PARENT_SCOPE)
+    message(STATUS "Found ONNX Runtime GenAI include dir: ${ORT_GENAI_INCLUDE_DIR}")
+    message(STATUS "Found ONNX Runtime GenAI library: ${ORT_GENAI_LIBRARY}")
+
+    if(WIN32)
+        find_file(ORT_GENAI_RUNTIME_DLL
+            NAMES onnxruntime-genai.dll onnxruntime_genai.dll
+            HINTS ${_flm_oga_roots}
+            PATH_SUFFIXES bin lib
+            NO_DEFAULT_PATH
+            REQUIRED)
+        find_file(ORT_RUNTIME_DLL
+            NAMES onnxruntime.dll
+            HINTS ${_flm_oga_roots}
+            PATH_SUFFIXES bin lib
+            NO_DEFAULT_PATH
+            REQUIRED)
+        find_file(ORT_PROVIDERS_SHARED_RUNTIME_DLL
+            NAMES onnxruntime_providers_shared.dll
+            HINTS ${_flm_oga_roots}
+            PATH_SUFFIXES bin lib
+            NO_DEFAULT_PATH
+            REQUIRED)
+        find_file(AMDGPU_EP_RUNTIME_DLL
+            NAMES amdgpu-ep.dll
+            HINTS ${_flm_oga_roots}
+            PATH_SUFFIXES bin lib
+            NO_DEFAULT_PATH
+            REQUIRED)
+        find_file(HIP_BACKEND_RUNTIME_DLL
+            NAMES hip-backend.dll
+            HINTS ${_flm_oga_roots}
+            PATH_SUFFIXES bin lib
+            NO_DEFAULT_PATH
+            REQUIRED)
+
+        set(ORT_GENAI_RUNTIME_DLLS
+            "${ORT_GENAI_RUNTIME_DLL}"
+            "${ORT_RUNTIME_DLL}"
+            "${ORT_PROVIDERS_SHARED_RUNTIME_DLL}"
+            "${AMDGPU_EP_RUNTIME_DLL}"
+            "${HIP_BACKEND_RUNTIME_DLL}")
+        set(ORT_GENAI_RUNTIME_DIRS "")
+        foreach(_flm_runtime_dll ${ORT_GENAI_RUNTIME_DLLS})
+            get_filename_component(_flm_runtime_dir "${_flm_runtime_dll}" DIRECTORY)
+            list(APPEND ORT_GENAI_RUNTIME_DIRS "${_flm_runtime_dir}")
+        endforeach()
+        list(REMOVE_DUPLICATES ORT_GENAI_RUNTIME_DIRS)
+        set(ORT_GENAI_RUNTIME_DLLS "${ORT_GENAI_RUNTIME_DLLS}" PARENT_SCOPE)
+        set(ORT_GENAI_RUNTIME_DIRS "${ORT_GENAI_RUNTIME_DIRS}" PARENT_SCOPE)
+        message(STATUS "Found ONNX Runtime GenAI runtime dirs: ${ORT_GENAI_RUNTIME_DIRS}")
+    else()
+        get_filename_component(_flm_ort_genai_lib_dir "${ORT_GENAI_LIBRARY}" DIRECTORY)
+        set(ORT_GENAI_RUNTIME_DIRS "${_flm_ort_genai_lib_dir}" PARENT_SCOPE)
+        message(STATUS "Found ONNX Runtime GenAI runtime dir: ${_flm_ort_genai_lib_dir}")
+    endif()
+endfunction()
+
+function(flm_stage_ort_genai_runtime TARGET_NAME)
+    if(WIN32)
+        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${TARGET_NAME}>"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/out")
+        foreach(_flm_runtime_dll ${ORT_GENAI_RUNTIME_DLLS})
+            add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_flm_runtime_dll}"
+                    "$<TARGET_FILE_DIR:${TARGET_NAME}>"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_flm_runtime_dll}"
+                    "${CMAKE_SOURCE_DIR}/out")
+        endforeach()
+    endif()
+endfunction()
 
 if(FLM_USE_HRX)
     set(FLM_RUNTIME_NAME "hrx")
@@ -228,6 +330,12 @@ if(CMAKE_CXX_STANDARD LESS 17)
     set(CMAKE_CXX_STANDARD 17)
 endif()
 
+if(NOT EXISTS "${CMAKE_SOURCE_DIR}/../third_party/tokenizers-cpp/CMakeLists.txt")
+    message(FATAL_ERROR
+        "Missing third_party/tokenizers-cpp submodule content. "
+        "From the repository root, run: scripts/bootstrap-fastflowlm-deps.sh")
+endif()
+
 add_subdirectory(${CMAKE_SOURCE_DIR}/../third_party/tokenizers-cpp
                  ${CMAKE_BINARY_DIR}/tokenizers-cpp
                  EXCLUDE_FROM_ALL)
@@ -237,6 +345,7 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/../third_party/tokenizers-cpp
 # ———————————————————————————————————————————————
 file(GLOB SOURCES "src/*.cpp" "runner/*.cpp" "common/*.cpp" "common/*/*.cpp" "server/*.cpp" "pull/*.cpp" )
 file(GLOB HEADERS "include/*.hpp" "runner/*.hpp" "common/*.hpp" "common/*/*.hpp" "server/*.hpp" "pull/*.hpp")
+list(FILTER SOURCES EXCLUDE REGEX ".*/hip_oga_main\\.cpp$")
 
 # Exclude files that depend on missing libraries for Linux
 if(NOT WIN32)
@@ -268,6 +377,14 @@ endif()
 
 
 add_executable(flm ${SOURCES} ${HEADERS})
+
+if(FLM_ENABLE_HIP_OGA)
+    flm_find_ort_genai()
+    target_include_directories(flm PUBLIC "${ORT_GENAI_INCLUDE_DIR}")
+    target_compile_definitions(flm PUBLIC FLM_ENABLE_HIP_OGA=1)
+    target_link_libraries(flm PUBLIC "${ORT_GENAI_LIBRARY}")
+    flm_stage_ort_genai_runtime(flm)
+endif()
 
 if(WIN32)
     if(VCPKG_TOOLCHAIN)
@@ -373,6 +490,19 @@ if(WIN32 AND NOT VCPKG_TOOLCHAIN)
         BOOST_ALL_NO_LIB
         BOOST_ALL_STATIC_LINK
     )
+endif()
+
+if(WIN32 AND NOT VCPKG_TOOLCHAIN)
+    file(GLOB FLM_BOOST_PROGRAM_OPTIONS_CANDIDATES
+        C:/dev/vcpkg/installed/x64-windows/lib/*boost_program_options*.lib
+        C:/dev/boost_1_88_0/stage/lib/*boost_program_options*.lib)
+    list(SORT FLM_BOOST_PROGRAM_OPTIONS_CANDIDATES)
+    list(REVERSE FLM_BOOST_PROGRAM_OPTIONS_CANDIDATES)
+    list(GET FLM_BOOST_PROGRAM_OPTIONS_CANDIDATES 0 FLM_BOOST_PROGRAM_OPTIONS_LIBRARY)
+    if(NOT FLM_BOOST_PROGRAM_OPTIONS_LIBRARY)
+        message(FATAL_ERROR "Could not find a Boost program_options import library. Install boost-program-options in vcpkg or provide C:/dev/boost_1_88_0/stage/lib.")
+    endif()
+    message(STATUS "Found Boost program_options import library: ${FLM_BOOST_PROGRAM_OPTIONS_LIBRARY}")
 endif()
 
 target_link_directories(flm PUBLIC
@@ -491,7 +621,7 @@ elseif(WIN32)
         swscale
         swresample
         libcurl
-        libboost_program_options-vc143-mt-x64-1_88
+        ${FLM_BOOST_PROGRAM_OPTIONS_LIBRARY}
         libfftw3-3
         libfftw3f-3
         libfftw3l-3
@@ -708,6 +838,7 @@ if(WIN32)
             "${CMAKE_SOURCE_DIR}/lib"
             "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin"
             "${_flm_rt_dep_dir}"
+            ${ORT_GENAI_RUNTIME_DIRS}
         PRE_EXCLUDE_REGEXES "api-ms-.*" "ext-ms-.*"
             # Optional Windows feature-on-demand / attestation / lockdown DLLs
             # that are not present as files on all hosts, so the resolver would

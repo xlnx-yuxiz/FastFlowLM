@@ -22,6 +22,9 @@ ModelDownloader::ModelDownloader(model_list& models)
 /// \param model_tag the model tag
 /// \return true if the model is downloaded, false otherwise
 ModelDownloader::ModelStatus ModelDownloader::is_model_downloaded(const std::string& model_tag, bool sub_process_mode, bool fast_check) {
+    if (supported_models.is_hip_oga_only_model(model_tag)) {
+        return ModelStatus::Missing;
+    }
     auto missing_files = get_missing_files(model_tag);
     bool is_config_file_missing = std::find(missing_files.begin(), missing_files.end(), "config.json") != missing_files.end();
     ModelStatus modelstatus = ModelStatus::Missing;
@@ -87,6 +90,10 @@ bool ModelDownloader::pull_model(const std::string& model_tag, bool use_modelsco
     try {
         // Get model info
         auto [new_model_tag, model_info] = supported_models.get_model_info(model_tag);
+        if (supported_models.is_hip_oga_only_model(new_model_tag)) {
+            header_print("ERROR", "Model " + new_model_tag + " requires --backend hip");
+            return false;
+        }
         std::string model_name = model_info["name"];
         std::string model_server = use_modelscope ? "ModelScope" : "HuggingFace";
         

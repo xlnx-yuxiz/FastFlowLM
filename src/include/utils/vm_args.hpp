@@ -92,6 +92,8 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
              "Output in JSON format (for list, validate, version commands)")
             ("ctx-len,c", po::value<int>(&parsed_args.ctx_length)->default_value(-1),
              "Set context length")
+            ("backend", po::value<std::string>(&parsed_args.backend)->default_value(""),
+             "Execution backend: npu (default) or hip. The hip backend requires -DFLM_ENABLE_HIP_OGA=ON")
             ("prefill-chunk-len,pcl", po::value<int>(&parsed_args.prefill_chunk_len)->default_value(-1),
              "Set prefill chunk length")
             ("img-pre-resize,r", po::value<int>(&parsed_args.img_pre_resize)->default_value(2),
@@ -105,7 +107,9 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
             ("preemption", po::value<bool>(&parsed_args.preemption)->default_value(false),
              "Enable preemption")
             ("prompt,i", po::value<std::string>(&parsed_args.input_file_name)->default_value(""),
-             "Direct file input")
+             "Prompt text for run, or benchmark config path for bench")
+            ("max-tokens", po::value<int>(&parsed_args.max_tokens)->default_value(-1),
+             "Maximum generated tokens for a non-interactive run prompt")
             ("bench-iterations", po::value<int>(&parsed_args.iterations)->default_value(2),
              "Iterations for bench");
 
@@ -134,15 +138,14 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
 
         // Help has highest priority
         if (vm.count("help")) {
-            // Custom help formatting to match the desired style
             print_help(general);
-            return false; // Exit after showing help
+            parsed_args.command = "help";
+            return true;
         }
 
         if (vm.count("version")) {
-            // Custom help formatting to match the desired style
-            std::cout << "FLM v" << __FLM_VERSION__ << std::endl;
-            return false; // Exit after showing help
+            parsed_args.command = "version";
+            return true;
         }
 
         // Extract command
@@ -152,7 +155,7 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
             // Handle help and version commands directly
             if (parsed_args.command == "help") {
                 print_help(general);
-                return false; // Exit after showing help
+                return true;
             }
             
             if (parsed_args.command == "version") {
@@ -210,6 +213,11 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
         // }
 
         // Note: serve command allows empty model_tag (will use default)
+
+        if (!vm["max-tokens"].defaulted() && parsed_args.max_tokens < 1) {
+            std::cerr << "Error: --max-tokens must be at least 1" << std::endl;
+            return false;
+        }
 
         // Validate power mode for run/serve commands
         if ((parsed_args.command == "run" || parsed_args.command == "serve") && 

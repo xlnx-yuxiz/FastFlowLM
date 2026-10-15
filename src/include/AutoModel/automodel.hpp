@@ -54,6 +54,7 @@ enum class StreamEventType {
 	CONTENT,        
 	REASONING,      
 	TOOL_DONE,
+	ERROR_EVENT,
 };
 
 struct StreamResult {
@@ -62,6 +63,7 @@ struct StreamResult {
 	std::string tool_id;       
 	std::string tool_name;     
 	std::string tool_args_str; 
+	std::string error_message;
 };
 
 struct NonStreamResult {
@@ -70,6 +72,7 @@ struct NonStreamResult {
 	std::string tool_name;
 	std::string tool_args;
 	std::vector<std::pair<std::string, std::string>> tool_calls_list; // (name, args) for multiple tool calls
+	std::string error_message;
 };
 
 typedef enum {
@@ -108,7 +111,8 @@ typedef enum {
 
 struct chat_meta_info_t {
 	int max_prefill_len;
-    int prompt_tokens;
+    int prompt_tokens;        // whole prompt, cached prefix included
+    int cached_prompt_tokens; // subset of prompt_tokens served from the KV cache
     int generated_tokens;
     uint64_t total_duration; // in nanoseconds
     uint64_t load_duration; // in nanoseconds
@@ -118,7 +122,7 @@ struct chat_meta_info_t {
 	bool restore_allowed;
 	tool_choice_t tool_choice;
 
-	chat_meta_info_t() : max_prefill_len(0), prompt_tokens(0), generated_tokens(0), total_duration(0), load_duration(0), prefill_duration(0), decoding_duration(0), stop_reason(EOT_DETECTED), restore_allowed(false), tool_choice(TOOL_CHOICE_AUTO) {}
+	chat_meta_info_t() : max_prefill_len(0), prompt_tokens(0), cached_prompt_tokens(0), generated_tokens(0), total_duration(0), load_duration(0), prefill_duration(0), decoding_duration(0), stop_reason(EOT_DETECTED), restore_allowed(false), tool_choice(TOOL_CHOICE_AUTO) {}
 };
 
 typedef enum {
@@ -248,6 +252,7 @@ public:
 
 	void reset_parser() {
 		buffer_.clear();
+		tool_name_.clear();
 		is_in_tool_block_ = false;
 		current_mode_ = StreamEventType::CONTENT;
 	}
@@ -483,5 +488,3 @@ public:
 		return result;
 	}
 };
-
-

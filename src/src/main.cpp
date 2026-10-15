@@ -7,8 +7,11 @@
 #pragma once
 #include "runner.hpp"
 #include "server.hpp"
+#include "backend_options.hpp"
+#include "hip_oga_policy.hpp"
 #include "model_list.hpp"
 #include "model_downloader.hpp"
+#include "hip_oga_public_downloader.hpp"
 #include "update.hpp"
 #include "utils/utils.hpp"
 #include "program_args.hpp"
@@ -165,6 +168,18 @@ void signal_handler(int signal) {
 ///@return the server
 std::unique_ptr<WebServer> create_lm_server(model_list& models, ModelDownloader& downloader, program_args_t& args);
 
+static void report_hip_oga_offload_policy(const nlohmann::json& model_info) {
+    const std::string policy = flm::hip_oga::runtime_offload_policy(model_info);
+    header_print("FLM", "HIP OGA offload_policy=" << policy);
+    if (policy == flm::hip_oga::kStrictGpuPolicy) {
+        header_print("FLM", "strict_gpu enforces session.disable_cpu_ep_fallback=1 for each OGA session section.");
+    }
+    const std::string warning = flm::hip_oga::policy_warning(policy);
+    if (!warning.empty()) {
+        header_print("WARNING", warning);
+    }
+}
+
 #ifdef _WIN32
 std::string get_driver_version(const std::string& device_name) {
     std::string driver_version;
@@ -234,21 +249,7 @@ static bool sanity_check_npu_stack(bool quiet, bool json_output = false) {
         }
         return false;
     }
-    int major, minor;
-    sscanf(u_name.release, "%d.%d", &major, &minor);
-    bool kernel_ok = (major > 6) || (major == 6 && minor >= 17);
     validation_json["kernel"] = u_name.release;
-    validation_json["kernel_ok"] = kernel_ok;
-    if (!kernel_ok) {
-        if (print_human) {
-            header_print_r("ERROR", "Kernel version incompatible with this version of FLM. Please update your kernel!");
-        }
-        validation_json["ready"] = false;
-        if (json_output) {
-            std::cout << validation_json.dump(4) << std::endl;
-        }
-        return false;
-    }
     if (print_human) {
         header_print("Linux", "Kernel: " << u_name.release);
     }
@@ -258,6 +259,7 @@ static bool sanity_check_npu_stack(bool quiet, bool json_output = false) {
     bool enough_cols = true;
     bool amd_device_found = false;
     bool drm_version_ok = true;
+    bool kernel_ok = true;
 
     for (int i = 0; i < 16; ++i) {
         std::string dev_name = "/dev/accel/accel" + std::to_string(i);
@@ -464,18 +466,52 @@ int main(int argc, char* argv[]) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
-#elif !defined(FLM_USE_HRX)
-    // XRT backend: preload bundled XRT libraries from the executable directory.
-    preload_bundled_libraries();
 #endif
-    
+
     // Parse command line arguments using Boost Program Options
     program_args_t parsed_args;
     if (!arg_utils::parse_options(argc, argv, parsed_args)) {
-        return 1; // Help was already printed by Boost Program Options
+        return 1;
     }
 
-    
+    if (parsed_args.command == "help") {
+        return 0;
+    }
+
+    if (parsed_args.command == "version") {
+        if (parsed_args.json_output) {
+            std::cout << "{ \"version\": \"" << __FLM_VERSION__ << "\" }" << std::endl;
+        } else {
+            std::cout << "FLM v" << __FLM_VERSION__ << std::endl;
+        }
+        return 0;
+    }
+
+    if (parsed_args.command == "port") {
+        if (parsed_args.json_output) {
+            std::cout << "{ \"port\": " << utils::get_server_port(parsed_args.port) << " }" << std::endl;
+        } else {
+            std::cout << "Server Port: " << utils::get_server_port(parsed_args.port) << std::endl;
+        }
+        return 0;
+    }
+
+    try {
+        parsed_args.backend = flm::backend::normalize_backend(parsed_args.backend);
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+    const bool using_hip_oga =
+        flm::backend::is_hip_oga_backend(parsed_args.backend);
+
+#if !defined(_WIN32) && !defined(FLM_USE_HRX)
+    if (!using_hip_oga) {
+        // XRT backend: preload bundled XRT libraries from the executable directory.
+        preload_bundled_libraries();
+    }
+#endif
+
     // Get the command, model tag, and force flag
     std::string exe_dir = utils::get_executable_directory();
     std::string config_path;
@@ -504,19 +540,46 @@ int main(int argc, char* argv[]) {
 #endif
 
     // Check if the commands and args valid
+    if (parsed_args.command == "validate" && using_hip_oga) {
+        const std::string direct_policy = flm::hip_oga::direct_model_offload_policy();
+        if (parsed_args.json_output) {
+            nlohmann::json validation_json = {
+                {"object", "backend_validation"},
+                {"backend", flm::backend::kHipOgaBackendId},
+                {"default_direct_offload_policy", direct_policy},
+                {"npu_stack_check", "skipped"},
+                {"ready", true}
+            };
+            const std::string warning = flm::hip_oga::policy_warning(direct_policy);
+            if (!warning.empty()) {
+                validation_json["policy_warning"] = warning;
+            }
+            std::cout << validation_json.dump(4) << std::endl;
+        } else {
+            header_print("FLM", "HIP OGA backend selected; skipping NPU stack validation. Direct OGA offload_policy=" << direct_policy);
+            const std::string warning = flm::hip_oga::policy_warning(direct_policy);
+            if (!warning.empty()) {
+                header_print("WARNING", warning);
+            }
+        }
+        return 0;
+    }
+
     if (parsed_args.command == "validate") {
         stable_stack = sanity_check_npu_stack(parsed_args.command != "validate", parsed_args.command == "validate" && parsed_args.json_output);
         return stable_stack ? 0 : 1;
     }
 
     if (parsed_args.command == "run" || parsed_args.command == "serve" || parsed_args.command == "pull" || parsed_args.command == "remove" || parsed_args.command == "check" || parsed_args.command == "bench") {
-      if (parsed_args.model_tag != "model-faker" && (!availble_models.is_model_supported(parsed_args.model_tag))) {
+      const bool hip_direct_path =
+          using_hip_oga && HipOgaModel::is_model_dir(parsed_args.model_tag);
+      if (!hip_direct_path && parsed_args.model_tag != "model-faker" && (!availble_models.is_model_supported(parsed_args.model_tag))) {
             header_print("ERROR", "Model not found: " << parsed_args.model_tag << "; Please check with `flm list` and try again.");
             return 1;
         }
     }
   
-    if (parsed_args.command == "serve" || parsed_args.command == "run" || parsed_args.command == "bench"){
+    if (!using_hip_oga && (parsed_args.command == "serve" || parsed_args.command == "run" || parsed_args.command == "bench")){
         // Configure AMD XRT for the specified power mode
         if (parsed_args.power_mode == "default" || parsed_args.power_mode == "powersaver" || parsed_args.power_mode == "balanced" || 
             parsed_args.power_mode == "performance" || parsed_args.power_mode == "turbo") {
@@ -545,7 +608,8 @@ int main(int argc, char* argv[]) {
         rlim_t asr_size = 0;
         rlim_t embedding_size = 0;
 
-        if (parsed_args.model_tag != "model-faker" && !parsed_args.model_tag.empty()) {
+        if (parsed_args.model_tag != "model-faker" && !parsed_args.model_tag.empty() &&
+            !(using_hip_oga && HipOgaModel::is_model_dir(parsed_args.model_tag))) {
             auto [resolved_tag, model_info] = availble_models.get_model_info(parsed_args.model_tag);
             if (model_info.contains("size")) {
                 model_size = model_info["size"].get<uint64_t>();
@@ -577,24 +641,6 @@ int main(int argc, char* argv[]) {
 #endif
 
     // code for all commands:
-    
-    if (parsed_args.command == "version") {
-        if (parsed_args.json_output) {
-            std::cout << "{ \"version\": \"" << __FLM_VERSION__ << "\" }" << std::endl;
-        } else {
-            std::cout << "FLM v" << __FLM_VERSION__ << std::endl;
-        }
-        return 0;
-    }
-
-    if (parsed_args.command == "port"){
-        if (parsed_args.json_output) {
-            std::cout << "{ \"port\": " << utils::get_server_port(parsed_args.port) << " }" << std::endl;
-        } else {
-            std::cout << "Server Port: " << utils::get_server_port(parsed_args.port) << std::endl;
-        }
-        return 0;
-    }
 
     if (parsed_args.preemption){
         header_print("FLM", "Allowing high priority tasks to preempt FLM!");
@@ -612,7 +658,12 @@ int main(int argc, char* argv[]) {
         }
 
         if (parsed_args.command == "bench") {
-            benchmarking::BenchmarkResults_t results = benchmarking::run_benchmarks(parsed_args.model_tag, parsed_args.input_file_name, availble_models, parsed_args.iterations);
+            benchmarking::BenchmarkResults_t results =
+                benchmarking::run_benchmarks(parsed_args.model_tag,
+                                             parsed_args.input_file_name,
+                                             availble_models,
+                                             parsed_args.iterations,
+                                             parsed_args.backend);
         }
         else if (parsed_args.command == "run") {
             check_and_notify_new_version();
@@ -646,18 +697,48 @@ int main(int argc, char* argv[]) {
             // server->stop();
         }
         else if (parsed_args.command == "pull") {
+            if (using_hip_oga) {
+                if (HipOgaModel::is_model_dir(parsed_args.model_tag)) {
+                    header_print("ERROR", "Backend 'hip' pull expects a model-list tag with hip_oga.public_hf metadata; direct OGA directories are already local.");
+                    return 1;
+                }
+                flm::hip_oga::PublicHfDownloader hip_downloader(availble_models);
+                bool success = hip_downloader.pull(parsed_args.model_tag,
+                                                   parsed_args.force_redownload);
+                if (!success) {
+                    header_print("ERROR", "Failed to pull HIP OGA model: " + parsed_args.model_tag);
+                    return 1;
+                }
+            } else {
                 bool success = downloader.pull_model(parsed_args.model_tag, parsed_args.modelscope, parsed_args.force_redownload);
                 if (!success) {
                     header_print("ERROR", "Failed to pull model: " + parsed_args.model_tag);
-                    return 1; 
+                    return 1;
                 }
+            }
         }
         else if (parsed_args.command == "remove") {
             // Remove the model, this will be used to remove the model
             downloader.remove_model(parsed_args.model_tag);
         }
         else if (parsed_args.command == "check") {
-            downloader.check_model(parsed_args.model_tag, parsed_args.modelscope);
+            if (using_hip_oga) {
+                if (HipOgaModel::is_model_dir(parsed_args.model_tag)) {
+                    model_list::validate_hip_oga_model_dir(parsed_args.model_tag);
+                    report_hip_oga_offload_policy(
+                        HipOgaModel::model_info_for_path(parsed_args.model_tag));
+                    header_print("FLM", "HIP OGA model directory is ready: " << parsed_args.model_tag);
+                } else {
+                    auto [new_tag, selected_model_info] =
+                        availble_models.get_model_info(parsed_args.model_tag);
+                    report_hip_oga_offload_policy(selected_model_info);
+                    std::string model_path = availble_models.get_hip_oga_model_path(new_tag);
+                    header_print("FLM", "HIP OGA model tag '" << new_tag <<
+                        "' resolves to ready package: " << model_path);
+                }
+            } else {
+                downloader.check_model(parsed_args.model_tag, parsed_args.modelscope);
+            }
         }
         else if (parsed_args.command == "list") {
             // List the models, this will be used to list the models
@@ -665,15 +746,23 @@ int main(int argc, char* argv[]) {
                 header_print("Error", "Invalid filter: please use 'all', 'installed', or 'not-installed'");
                 return 1;
             }
+            const bool list_hip_oga = using_hip_oga;
             if (parsed_args.json_output) {
                 nlohmann::json output_json;
                 output_json["models"] = nlohmann::json::array();
-                nlohmann::json models = availble_models.get_all_models();
+                nlohmann::json models = list_hip_oga
+                    ? availble_models.get_all_hip_oga_models()
+                    : availble_models.get_all_models();
                 for (const auto& model : models["models"]) {
                     // Fast path: `list` only needs presence + compatibility,
                     // so skip HF metadata fetch and per-file hash verification.
-                    ModelDownloader::ModelStatus status = downloader.is_model_downloaded(model["name"].get<std::string>(), /*parsed_args.sub_process_mode*/true, /*fast_check=*/true);
-                    bool is_present = (status == ModelDownloader::ModelStatus::Ready);
+                    bool is_present = false;
+                    if (list_hip_oga) {
+                        is_present = model.value("installed", false);
+                    } else {
+                        ModelDownloader::ModelStatus status = downloader.is_model_downloaded(model["name"].get<std::string>(), /*parsed_args.sub_process_mode*/true, /*fast_check=*/true);
+                        is_present = (status == ModelDownloader::ModelStatus::Ready);
+                    }
                     if ((parsed_args.list_filter == "installed") == is_present || parsed_args.list_filter == "all") {
                         nlohmann::json model_entry = model;
                         model_entry["installed"] = is_present;
@@ -684,14 +773,33 @@ int main(int argc, char* argv[]) {
             }
             else {
                 std::cout << "Models:" << std::endl;
-                nlohmann::json models = availble_models.get_all_models();
+                nlohmann::json models = list_hip_oga
+                    ? availble_models.get_all_hip_oga_models()
+                    : availble_models.get_all_models();
                 bool any_model_listed = false;
                 for (const auto& model : models["models"]) {
                     // Fast path: skip HF metadata fetch and per-file hash verification.
-                    ModelDownloader::ModelStatus status = downloader.is_model_downloaded(model["name"].get<std::string>(), parsed_args.sub_process_mode, /*fast_check=*/true);
-                    bool is_present = (status == ModelDownloader::ModelStatus::Ready);
+                    ModelDownloader::ModelStatus status = ModelDownloader::ModelStatus::Missing;
+                    bool is_present = false;
+                    if (list_hip_oga) {
+                        is_present = model.value("installed", false);
+                        status = is_present ? ModelDownloader::ModelStatus::Ready
+                                            : ModelDownloader::ModelStatus::Missing;
+                    } else {
+                        status = downloader.is_model_downloaded(model["name"].get<std::string>(), parsed_args.sub_process_mode, /*fast_check=*/true);
+                        is_present = (status == ModelDownloader::ModelStatus::Ready);
+                    }
                     if ((parsed_args.list_filter == "installed") == is_present || parsed_args.list_filter == "all") {
                         std::cout << "  - " << model["name"].get<std::string>();
+                        if (list_hip_oga) {
+                            const std::string offload_policy =
+                                model.value("offload_policy", flm::hip_oga::kUnqualifiedPolicy);
+                            std::cout << " [" << offload_policy << "]";
+                            const std::string warning = flm::hip_oga::policy_warning(offload_policy);
+                            if (!warning.empty()) {
+                                std::cout << " WARNING: " << warning;
+                            }
+                        }
                         if (!parsed_args.sub_process_mode) {
                             switch (status) {
                                 case ModelDownloader::ModelStatus::Ready:        std::cout << " ✅"; break;

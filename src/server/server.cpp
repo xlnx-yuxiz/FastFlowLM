@@ -7,6 +7,7 @@
  *  \version 0.9.24
  */
 #include "server.hpp"
+#include "backend_options.hpp"
 #include "rest_handler.hpp"
 #include <sstream>
 #include <thread>
@@ -157,16 +158,31 @@ int NPUAccessManager::get_active_npu_requests() {
 }
 
 // Helper function to check if an endpoint requires NPU access
-bool requires_npu_access(const std::string& method, const std::string& path) {
-    // NPU-intensive endpoints that should be restricted to one user at a time
-    if (method == "POST") {
-        return path == "/api/generate" || 
-               path == "/api/chat" || 
-               path == "/v1/chat/completions" ||
-               path == "/v1/audio/transcriptions" ||
-               path == "/v1/embeddings";
+bool requires_npu_access(const std::string& method,
+                         const std::string& path,
+                         const nlohmann::json& request,
+                         const std::string& default_backend) {
+    if (method != "POST") return false;
+
+    const bool text_generation_path =
+        path == "/api/generate" ||
+        path == "/api/chat" ||
+        path == "/v1/chat/completions";
+    if (text_generation_path) {
+        std::string requested_backend = default_backend;
+        if (request.is_object() && request.contains("backend") &&
+            request["backend"].is_string()) {
+            requested_backend = request["backend"].get<std::string>();
+        }
+        try {
+            return !flm::backend::is_hip_oga_backend(
+                flm::backend::normalize_backend(requested_backend));
+        } catch (...) {
+            return true;
+        }
     }
-    return false;
+
+    return path == "/v1/audio/transcriptions" || path == "/v1/embeddings";
 }
 
 ///@brief HttpSession class implementation
@@ -648,7 +664,7 @@ bool WebServer::handle_request(http::request<http::string_body>& req,
             std::string content_type = std::string(req[http::field::content_type]);
 
             if (content_type.find("application/json") != std::string::npos) {
-                json request_json_log = json::parse(req.body());
+                request_json_log = json::parse(req.body());
                 brief_print_message_request(request_json_log);
                 is_json = true;
             }
@@ -674,7 +690,10 @@ bool WebServer::handle_request(http::request<http::string_body>& req,
     }
 
     // Decide if this handler needs exclusive NPU access.
-    bool needs_npu = requires_npu_access(std::string(req.method_string()), std::string(req.target()));
+    bool needs_npu = requires_npu_access(std::string(req.method_string()),
+                                         std::string(req.target()),
+                                         request_json_log,
+                                         default_backend_);
 
     // Store stable pointers for deferred execution to avoid reference lifetime issues.
     auto* req_ptr = &req;
@@ -863,6 +882,7 @@ bool WebServer::handle_request(http::request<http::string_body>& req,
 ///@return the server
 std::unique_ptr<WebServer> create_lm_server(model_list& models, ModelDownloader& downloader, program_args_t& args) {
     auto server = std::make_unique<WebServer>(args.host, args.port, args.cors);
+    server->set_default_backend(args.backend);
     auto rest_handler = std::make_shared<RestHandler>(models, downloader, args);
     
     // Register Ollama-compatible routes

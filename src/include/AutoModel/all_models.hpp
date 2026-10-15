@@ -24,8 +24,11 @@
 #include "modeling_gemma4e.hpp"
 #include "modeling_hunyuan.hpp"
 #include "modeling_gemma4_12b.hpp"
+#include "backend_options.hpp"
+#include "AutoModel/hip_oga_model.hpp"
 #include "model_list.hpp"
 #include "nlohmann/json.hpp"
+#include <stdexcept>
 
 typedef enum {
     llama3,
@@ -56,7 +59,9 @@ typedef enum {
     error_embedding
 } SupportedModelFamily;
 
-inline std::pair<std::string, std::unique_ptr<AutoModel>> get_auto_model(const std::string& model_tag, model_list& available_models, flm_rt::device* npu_device_inst) {
+inline std::pair<std::string, std::unique_ptr<AutoModel>> get_auto_model(
+    const std::string& model_tag, model_list& available_models,
+    flm_rt::device* npu_device_inst, const std::string& backend = "") {
 
     
     static const std::map<std::string, SupportedModelFamily> modelFamilyMap = {
@@ -89,7 +94,16 @@ inline std::pair<std::string, std::unique_ptr<AutoModel>> get_auto_model(const s
     };
 
     
+    const std::string resolved_backend = flm::backend::normalize_backend(backend);
+
     if (available_models.is_model_supported(model_tag) == false) {
+        if (flm::backend::is_hip_oga_backend(resolved_backend)) {
+            if (HipOgaModel::is_model_dir(model_tag)) {
+                return std::make_pair(model_tag, std::make_unique<HipOgaModel>());
+            }
+            throw std::runtime_error(
+                "Backend 'hip' needs a supported model tag or an OGA model directory containing genai_config.json");
+        }
         header_print_r("ERROR", "Model tag '" << model_tag << "' is not supported. Please check the model list.");
         return std::make_pair("llama3.2:1b", std::make_unique<Llama3>(npu_device_inst));
     }
@@ -97,7 +111,26 @@ inline std::pair<std::string, std::unique_ptr<AutoModel>> get_auto_model(const s
     std::unique_ptr<AutoModel> auto_chat_engine = nullptr;
     auto [new_model_tag, model_info] = available_models.get_model_info(model_tag);
 
-    switch(modelFamilyMap.at(model_info["details"]["family"])) {
+    if (flm::backend::is_hip_oga_backend(resolved_backend)) {
+        if (!available_models.has_hip_oga_model_path(new_model_tag)) {
+            throw std::runtime_error(
+                "Backend 'hip' needs model-list metadata hip_oga.config_path for tag '" +
+                new_model_tag + "' or an OGA model directory containing genai_config.json");
+        }
+        available_models.require_hip_oga_runtime_supported(new_model_tag);
+        return std::make_pair(new_model_tag, std::make_unique<HipOgaModel>());
+    }
+
+    if (model_info.contains("hip_oga") && model_info["hip_oga"].is_object() &&
+        model_info["hip_oga"].value("hip_only", false)) {
+        throw std::runtime_error(
+            "Model tag '" + new_model_tag +
+            "' is a HIP OGA catalog entry; run with --backend hip");
+    }
+
+    const auto family = modelFamilyMap.at(model_info["details"]["family"]);
+
+    switch(family) {
         case SupportedModelFamily::llama3:
             auto_chat_engine = std::make_unique<Llama3>(npu_device_inst);
             break;

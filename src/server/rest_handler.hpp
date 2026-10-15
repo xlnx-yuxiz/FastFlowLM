@@ -108,11 +108,13 @@ public:
         std::shared_ptr<CancellationToken> cancellation_token = nullptr);
 
 private:
-    bool ensure_model_loaded(const std::string& model_tag);
+    bool ensure_model_loaded(const std::string& model_tag,
+                             const std::string& request_backend = "");
     void ensure_asr_model_loaded(const std::string& model_tag);
     void ensure_embed_model_loaded(const std::string& model_tag);
+    flm_rt::device* ensure_npu_device();
     void configure_chat_engine_parameters(const json& options, const json& request);
-    json build_nstream_response(std::string response_text, chat_meta_info_t& meta_info);
+    json build_nstream_response(const NonStreamResult& result, chat_meta_info_t& meta_info);
 
 
     std::unique_ptr<AutoModel> auto_chat_engine;
@@ -120,11 +122,13 @@ private:
     std::unique_ptr<Whisper> whisper_engine;
     std::unique_ptr<AutoEmbeddingModel> auto_embedding_engine;
 #endif
-    flm_rt::device npu_device_inst;
+    std::unique_ptr<flm_rt::device> npu_device_inst;
     model_list& supported_models;
     ModelDownloader& downloader;
     std::string current_model_tag;
     std::string default_model_tag;
+    std::string backend;
+    std::string current_backend;
     bool modelscope;
     bool asr;
     bool embed;

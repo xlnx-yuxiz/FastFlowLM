@@ -19,10 +19,12 @@ struct program_args_t {
     bool embed = false;
     bool json_output = false;
     int ctx_length = -1; // let model decide
+    std::string backend = ""; // empty/npu = FastFlowLM NPU path; hip = OGA over HIP EP
     int prefill_chunk_len = -1; // let model decide
 
     // handling input file
     std::string input_file_name = "";
+    int max_tokens = -1;
     int iterations = 2;
 
     // specific commands

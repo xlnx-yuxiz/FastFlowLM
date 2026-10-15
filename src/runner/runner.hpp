@@ -48,6 +48,7 @@ class Runner {
         void run();
     private:
         std::string tag;
+        std::string initial_prompt;
         bool modelscope;
         int prefill_chunk_len;
         bool asr;
@@ -64,10 +65,14 @@ class Runner {
         int ctx_length;
         std::string system_prompt;
         bool preemption;
+        std::string backend;
         int img_pre_resize;
         // CLI instance for interactive input
         CLIWide cli;
-        flm_rt::device npu_device_inst;
+        std::unique_ptr<flm_rt::device> npu_device_inst;
+
+        flm_rt::device* ensure_npu_device();
+        bool generate_once(const std::string& input, std::ostream& base_ostream);
 
         /// \brief Command functions
         void cmd_set(std::vector<std::string>& input_list);

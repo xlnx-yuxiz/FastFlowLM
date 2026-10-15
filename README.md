@@ -1,3 +1,15 @@
+# HIP OGA Demo Branch
+
+This branch adds an experimental FastFlowLM backend for AMDGPU through ONNX
+Runtime GenAI and HIP EP. It also includes an opt-in text prefix cache. See
+[HIP_OGA_DEMO.md](HIP_OGA_DEMO.md) for build, model, runtime, and validation
+details.
+
+The prefix cache is disabled by default and is not a production-readiness or
+performance claim.
+
+---
+
 <p align="center">
   <a href="https://www.fastflowlm.com" target="_blank">
     <img src="assets/logo.png" alt="FastFlowLM Logo" width="200"/>

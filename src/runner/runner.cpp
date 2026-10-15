@@ -7,7 +7,9 @@
 *  \version 0.9.21
 */
 #include "runner.hpp"
+#include "backend_options.hpp"
 #include "harmony_filter.hpp"
+#include "hip_oga_policy.hpp"
 #ifndef FASTFLOWLM_LINUX_LIMITED_MODELS
 #include "AutoEmbeddingModel/all_embedding_model.hpp"
 #endif
@@ -20,6 +22,7 @@
 #include <algorithm>
 #include <thread>
 #include <chrono>
+#include <stdexcept>
 
 /// \brief Command map for command line input
 std::map<std::string, runner_cmd_t> cmd_map = {
@@ -34,14 +37,37 @@ std::map<std::string, runner_cmd_t> cmd_map = {
     {"/? shortcuts", CMD_HELP_SHOTCUT},
 };
 
+namespace {
+
+void report_hip_oga_offload_policy(const json& model_info) {
+    const std::string policy = flm::hip_oga::runtime_offload_policy(
+        nlohmann::json::parse(model_info.dump()));
+    header_print("FLM", "HIP OGA offload_policy=" << policy);
+    if (policy == flm::hip_oga::kStrictGpuPolicy) {
+        header_print("FLM", "strict_gpu enforces session.disable_cpu_ep_fallback=1 for each OGA session section.");
+    }
+    const std::string warning = flm::hip_oga::policy_warning(policy);
+    if (!warning.empty()) {
+        header_print("WARNING", warning);
+    }
+}
+
+}  // namespace
+
 /// \brief Constructor
 /// \param supported_models - the list of supported models
 /// \param downloader - the downloader for the models
 /// \param tag - the tag of the model to load
 Runner::Runner(model_list& supported_models, ModelDownloader& downloader, program_args_t& args)
-    : supported_models(supported_models), downloader(downloader), tag(args.model_tag), modelscope(args.modelscope), asr(args.asr), embed(args.embed), img_pre_resize(args.img_pre_resize), preemption(args.preemption) {
+    : supported_models(supported_models), downloader(downloader), tag(args.model_tag),
+      initial_prompt(args.input_file_name), modelscope(args.modelscope), asr(args.asr), embed(args.embed),
+      img_pre_resize(args.img_pre_resize), preemption(args.preemption),
+      backend(flm::backend::normalize_backend(args.backend)) {
 
-    this->npu_device_inst = flm_rt::device(0);
+    if (flm::backend::is_hip_oga_backend(this->backend) && (this->asr || this->embed)) {
+        throw std::runtime_error(
+            "ASR and embedding models remain NPU-only; do not combine them with --backend hip");
+    }
 
     if (args.ctx_length != -1) {
         this->ctx_length = args.ctx_length >= 512 ? args.ctx_length : 512;
@@ -53,27 +79,53 @@ Runner::Runner(model_list& supported_models, ModelDownloader& downloader, progra
     if (this->auto_chat_engine != nullptr) {
         this->auto_chat_engine.reset();
     }
-    std::pair<std::string, std::unique_ptr<AutoModel>> auto_model = get_auto_model(this->tag, this->supported_models, &this->npu_device_inst);
-    this->auto_chat_engine = std::move(auto_model.second);
-    
-    this->tag = auto_model.first;
+    const bool using_hip_oga = flm::backend::is_hip_oga_backend(this->backend);
+    const bool hip_direct_path =
+        using_hip_oga && HipOgaModel::is_model_dir(this->tag);
+    json model_info;
+    std::string model_path;
+    if (hip_direct_path) {
+        this->auto_chat_engine = std::make_unique<HipOgaModel>();
+        model_info = HipOgaModel::model_info_for_path(this->tag);
+        model_path = this->tag;
+    } else if (using_hip_oga) {
+        std::pair<std::string, std::unique_ptr<AutoModel>> auto_model =
+            get_auto_model(this->tag, this->supported_models, nullptr, this->backend);
+        this->auto_chat_engine = std::move(auto_model.second);
+        this->tag = auto_model.first;
 
-    switch (this->downloader.is_model_downloaded(this->tag)) {
-        case ModelDownloader::ModelStatus::Ready:
-            break;
-        case ModelDownloader::ModelStatus::Outdated:
-        case ModelDownloader::ModelStatus::Missing:
-            this->downloader.pull_model(this->tag, this->modelscope);
-            break;
-        case ModelDownloader::ModelStatus::Incompatible:
-            exit(EXIT_FAILURE);
+        auto [new_tag, selected_model_info] = this->supported_models.get_model_info(this->tag);
+        model_info = std::move(selected_model_info);
+        model_path = this->supported_models.get_hip_oga_model_path(new_tag);
+        model_info["hip_oga"]["config_path"] = model_path;
+    } else {
+        std::pair<std::string, std::unique_ptr<AutoModel>> auto_model =
+            get_auto_model(this->tag, this->supported_models, ensure_npu_device(), this->backend);
+        this->auto_chat_engine = std::move(auto_model.second);
+        this->tag = auto_model.first;
+
+        switch (this->downloader.is_model_downloaded(this->tag)) {
+            case ModelDownloader::ModelStatus::Ready:
+                break;
+            case ModelDownloader::ModelStatus::Outdated:
+            case ModelDownloader::ModelStatus::Missing:
+                this->downloader.pull_model(this->tag, this->modelscope);
+                break;
+            case ModelDownloader::ModelStatus::Incompatible:
+                exit(EXIT_FAILURE);
+        }
+        auto [new_tag, selected_model_info] = this->supported_models.get_model_info(this->tag);
+        model_info = std::move(selected_model_info);
+        model_path = this->supported_models.get_model_path(new_tag);
     }
-    auto [new_tag, model_info] = this->supported_models.get_model_info(this->tag);
     this->asr_supported = model_info.contains("asr") && model_info["asr"];
     // header_print("ASR", asr_supported);
     this->auto_chat_engine->configure_parameter("img_pre_resize", this->img_pre_resize);
+    if (using_hip_oga) {
+        report_hip_oga_offload_policy(model_info);
+    }
     try {
-        this->auto_chat_engine->load_model(this->supported_models.get_model_path(new_tag), model_info, this->ctx_length, this->preemption);
+        this->auto_chat_engine->load_model(model_path, model_info, this->ctx_length, this->preemption);
     }
     catch (const std::exception& e) {
         header_print("ERROR", "Failed to load model: " + std::string(e.what()));
@@ -92,7 +144,7 @@ Runner::Runner(model_list& supported_models, ModelDownloader& downloader, progra
         this->prefill_chunk_len = 4096; // default value
     }
 
-    this->generate_limit = -1;
+    this->generate_limit = args.max_tokens;
 
 
     if (this->embed) {
@@ -119,7 +171,7 @@ Runner::Runner(model_list& supported_models, ModelDownloader& downloader, progra
                     header_print("ERROR", "Whisper is incompatible with this version of FastFlowLM, skipping... ");
                     return;
             }
-            this->whisper_engine = std::make_unique<Whisper>(&this->npu_device_inst);
+            this->whisper_engine = std::make_unique<Whisper>(ensure_npu_device());
             auto [new_whisper_tag, whisper_model_info] = this->supported_models.get_model_info(whisper_tag);
             std::string whisper_model_path = this->supported_models.get_model_path(new_whisper_tag);
             try {
@@ -145,11 +197,70 @@ Runner::Runner(model_list& supported_models, ModelDownloader& downloader, progra
 
 
 
+flm_rt::device* Runner::ensure_npu_device() {
+    if (!this->npu_device_inst) {
+        this->npu_device_inst = std::make_unique<flm_rt::device>(0);
+    }
+    return this->npu_device_inst.get();
+}
+
+bool Runner::generate_once(const std::string& input, std::ostream& base_ostream) {
+    chat_meta_info_t meta_info;
+    lm_uniform_input_t uniformed_input;
+    meta_info.max_prefill_len = this->prefill_chunk_len;
+    uniformed_input.prompt = input;
+
+    this->auto_chat_engine->start_total_timer();
+    this->auto_chat_engine->start_ttft_timer();
+    try {
+        bool success = this->auto_chat_engine->insert(meta_info, uniformed_input);
+        if (!success) {
+            header_print("WARNING", "Max length reached, stopping generation...");
+            return false;
+        }
+    } catch (const std::exception& e) {
+        header_print("ERROR", "Insertion error: " + std::string(e.what()));
+        this->auto_chat_engine->clear_context();
+        return false;
+    }
+
+    this->auto_chat_engine->stop_ttft_timer();
+
+    if (this->auto_chat_engine->get_current_model().find("gpt-oss") != std::string::npos) {
+        cli_harmony_filter harmony_filter_ostream(std::cout);
+        try {
+            this->auto_chat_engine->generate(meta_info, this->generate_limit, harmony_filter_ostream);
+        } catch (const std::exception& e) {
+            header_print("ERROR", "Generation error: " + std::string(e.what()));
+            this->auto_chat_engine->clear_context();
+            return false;
+        }
+    } else {
+        try {
+            this->auto_chat_engine->generate(meta_info, this->generate_limit, base_ostream);
+        } catch (const std::exception& e) {
+            header_print("ERROR", "Generation error: " + std::string(e.what()));
+            this->auto_chat_engine->clear_context();
+            return false;
+        }
+    }
+
+    this->auto_chat_engine->stop_total_timer();
+    std::cout << std::endl;
+    return true;
+}
+
 /// \brief Run the runner
 void Runner::run() {
     bool verbose = false;
     this->system_prompt = "";
     this->auto_chat_engine->configure_parameter("system_prompt", this->system_prompt);
+    if (!this->initial_prompt.empty()) {
+        if (!this->generate_once(this->initial_prompt, std::cout)) {
+            exit(EXIT_FAILURE);
+        }
+        return;
+    }
     std::wstring_convert<std::codecvt_utf8<wchar_t>> utf8conv;
     wstream_buf obuf(std::cout);
     std::ostream base_ostream(&obuf);
@@ -363,6 +474,8 @@ void Runner::run() {
             
             this->auto_chat_engine->start_ttft_timer();
             try {
+                (void)this->auto_chat_engine->configure_parameter(
+                    "hip_oga_requested_max_tokens", this->generate_limit);
                 bool success = this->auto_chat_engine->insert(meta_info, uniformed_input);
                 if (!success){
                     header_print("WARNING", "Max length reached, stopping generation...");
@@ -425,32 +538,62 @@ void Runner::cmd_status(std::vector<std::string>& input_list) {
 void Runner::cmd_load(std::vector<std::string>& input_list) {
     std::string model_name = input_list[1];
 
-    std::pair<std::string, std::unique_ptr<AutoModel>> auto_model = get_auto_model(model_name, this->supported_models, &this->npu_device_inst);
-    model_name = auto_model.first;
+    const bool using_hip_oga = flm::backend::is_hip_oga_backend(this->backend);
+    const bool hip_direct_path =
+        using_hip_oga && HipOgaModel::is_model_dir(model_name);
+    std::pair<std::string, std::unique_ptr<AutoModel>> auto_model;
+    if (hip_direct_path) {
+        auto_model = std::make_pair(model_name, std::make_unique<HipOgaModel>());
+    } else if (using_hip_oga) {
+        auto_model = get_auto_model(model_name, this->supported_models, nullptr, this->backend);
+        model_name = auto_model.first;
+    } else {
+        auto_model = get_auto_model(model_name, this->supported_models, ensure_npu_device(), this->backend);
+        model_name = auto_model.first;
+    }
 
     if (model_name != this->tag) {
         this->tag = model_name;
 
-        switch (this->downloader.is_model_downloaded(this->tag)) {
-            case ModelDownloader::ModelStatus::Ready:
-                break;
-            case ModelDownloader::ModelStatus::Outdated:
-            case ModelDownloader::ModelStatus::Missing:
-                this->downloader.pull_model(this->tag, this->modelscope);
-                break;
-            case ModelDownloader::ModelStatus::Incompatible:
-                header_print("ERROR", "Model is incompatible with this version of FastFlowLM: " + this->tag);
-                exit(EXIT_FAILURE);
+        if (!using_hip_oga) {
+            switch (this->downloader.is_model_downloaded(this->tag)) {
+                case ModelDownloader::ModelStatus::Ready:
+                    break;
+                case ModelDownloader::ModelStatus::Outdated:
+                case ModelDownloader::ModelStatus::Missing:
+                    this->downloader.pull_model(this->tag, this->modelscope);
+                    break;
+                case ModelDownloader::ModelStatus::Incompatible:
+                    header_print("ERROR", "Model is incompatible with this version of FastFlowLM: " + this->tag);
+                    exit(EXIT_FAILURE);
+            }
         }
         auto_chat_engine.reset();
         if(model_name=="gpt-oss:20b")
             std::this_thread::sleep_for(std::chrono::milliseconds(2800));
         this->auto_chat_engine = std::move(auto_model.second);
 
-        auto [new_tag, model_info] = this->supported_models.get_model_info(this->tag);
+        json model_info;
+        std::string model_path;
+        if (hip_direct_path) {
+            model_info = HipOgaModel::model_info_for_path(this->tag);
+            model_path = this->tag;
+        } else if (using_hip_oga) {
+            auto [new_tag, selected_model_info] = this->supported_models.get_model_info(this->tag);
+            model_info = std::move(selected_model_info);
+            model_path = this->supported_models.get_hip_oga_model_path(new_tag);
+            model_info["hip_oga"]["config_path"] = model_path;
+        } else {
+            auto [new_tag, selected_model_info] = this->supported_models.get_model_info(this->tag);
+            model_info = std::move(selected_model_info);
+            model_path = this->supported_models.get_model_path(new_tag);
+        }
         this->auto_chat_engine->configure_parameter("img_pre_resize", this->img_pre_resize);
+        if (using_hip_oga) {
+            report_hip_oga_offload_policy(model_info);
+        }
         try {
-            this->auto_chat_engine->load_model(this->supported_models.get_model_path(new_tag), model_info, this->ctx_length, this->preemption);
+            this->auto_chat_engine->load_model(model_path, model_info, this->ctx_length, this->preemption);
         }
         catch (const std::exception& e) {
             header_print("ERROR", "Failed to load model: " + std::string(e.what()));
@@ -667,5 +810,3 @@ void Runner::cmd_help(std::vector<std::string>& input_list) {
 void Runner::cmd_help_shotcut(std::vector<std::string>& input_list) {
     std::cout << "Help shotcut" << std::endl;
 }
-
-
