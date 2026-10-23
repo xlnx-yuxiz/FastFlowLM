@@ -67,6 +67,16 @@ model_list_test = read("src/test/hip_oga_backend_static/test_hip_oga_model_list.
 public_pull_test = read("src/test/hip_oga_backend_static/test_hip_oga_public_pull.py")
 tool_parser_fixture = read("src/test/hip_oga_backend_static/test_hip_oga_openai_tool_parser.py")
 prefix_cache_test = read("src/test/hip_oga_backend_static/test_hip_oga_prefix_cache.cpp")
+text_codec_header = read("src/include/AutoModel/hip_oga_text_codec.hpp")
+text_codec_test = read("src/test/hip_oga_backend_static/test_hip_oga_text_codec.cpp")
+text_codec_validator = read("src/test/hip_oga_backend_static/validate_hip_oga_text_codec_contract.py")
+text_codec_schema = json.loads(read("src/test/hip_oga_backend_static/hip_oga_text_codec_evidence.schema.json"))
+text_codec_fixture = json.loads(read("src/test/hip_oga_backend_static/fixtures/hip_oga_text_codec_deterministic_fixture.json"))
+external_tokenizer_header = read("src/include/AutoModel/hip_oga_external_tokenizer.hpp")
+external_tokenizer_source = read("src/common/AutoModel/hip_oga_external_tokenizer.cpp")
+external_tokenizer_test = read("src/test/hip_oga_backend_static/test_hip_oga_external_tokenizer.cpp")
+tokenizer_parity_tool = read("src/test/hip_oga_external_codec/tokenizer_parity.py")
+tokenizer_text_cases = json.loads(read("src/test/hip_oga_external_codec/fixtures/text_cases.json"))
 tool_parser_cpp = ROOT / "src/test/hip_oga_backend_static/test_hip_oga_tool_parser.cpp"
 bootstrap_script = read_required(
     "scripts/bootstrap-fastflowlm-deps.sh",
@@ -121,6 +131,116 @@ require('if (parsed_args.command == "help")' in main_cpp and
         'if (parsed_args.command == "port")' in main_cpp,
         "main must handle help/version/port as successful early exits")
 require("FLM_BACKEND" in read("src/include/backend_options.hpp"), "FLM_BACKEND env override is not wired")
+require("enum class TextCodecProvider" in text_codec_header,
+        "missing shared text-codec provider enum")
+require("TextCodecProvider::Oga" in text_codec_header and
+        "TextCodecProvider::External" in text_codec_header,
+        "text-codec provider enum must name OGA and external providers")
+require("enum class ParityStatus" in text_codec_header and
+        "struct TextCodecParityResult" in text_codec_header,
+        "missing shared parity result types")
+require("enum class DecoderEquivalenceClass" in text_codec_header and
+        "ByteExact" in text_codec_header and
+        "CanonicalEquivalent" in text_codec_header and
+        "StructuredEquivalent" in text_codec_header and
+        "Incompatible" in text_codec_header,
+        "missing explicit decoder equivalence classes")
+require("classify_decoder_text_equivalence" in text_codec_header and
+        "gemma_standalone_metaspace_is_space" in text_codec_header,
+        "missing model-aware decoder canonical-equivalence classifier")
+require("decoder_policy_from_tokenizer_contract" in text_codec_header and
+        "decoder_step_replaces_metaspace_with_space" in text_codec_header and
+        '"Replace"' in text_codec_header and
+        '"String"' in text_codec_header,
+        "Gemma decoder policy must detect tokenizer.json Replace metaspace contracts")
+require("parse_text_codec_selector" in text_codec_header,
+        "missing text-codec selector parser")
+require("default_text_codec_selector" in text_codec_header,
+        "missing text-codec default selector")
+require("ExternalCumulativeDetokenizer" in text_codec_header and
+        "CumulativeDecodeCallback" in text_codec_header,
+        "missing callback-based external cumulative detokenizer")
+require("valid_utf8_prefix_length" in text_codec_header,
+        "external detokenizer must guard UTF-8 prefix emission")
+require('parse_text_codec_selector("")' in text_codec_test and
+        "TextCodecProvider::Oga" in text_codec_test,
+        "selector test must prove empty selector defaults to OGA")
+require("tokenizers-cpp" in text_codec_test,
+        "selector test must reject unsupported external selector names")
+require("TextCodecParityResult result" in text_codec_test and
+        "ParityStatus::NotRun" in text_codec_test,
+        "selector test must cover parity result defaults")
+require("test_external_cumulative_decoder_delays_until_prefix_is_stable" in text_codec_test and
+        "test_external_cumulative_decoder_may_lag_immediate_oga_stream" in text_codec_test and
+        "test_external_cumulative_decoder_holds_split_utf8_until_final_flush" in text_codec_test and
+        "test_external_cumulative_decoder_fails_closed_when_emitted_prefix_is_revised" in text_codec_test,
+        "detokenizer tests must cover stable-prefix lag, UTF-8, and revision behavior")
+require("test_decoder_equivalence_accepts_gemma_standalone_metaspace_as_space" in text_codec_test and
+        "test_gemma_policy_detects_replace_decoder_contract" in text_codec_test and
+        "test_decoder_equivalence_does_not_globally_normalize_without_contract" in text_codec_test and
+        "test_decoder_equivalence_keeps_structured_json_strict" in text_codec_test,
+        "decoder-equivalence tests must cover Gemma canonicalization and strict structured semantics")
+require(text_codec_schema["properties"]["default_provider"]["const"] == "oga",
+        "text-codec evidence schema must keep default_provider=oga")
+require("detokenizer" in text_codec_schema["required"] and
+        text_codec_schema["properties"]["detokenizer"]["properties"]["mode"]["const"] == "callback_cumulative",
+        "text-codec evidence schema must expose callback-cumulative detokenizer parity")
+require(text_codec_fixture["default_provider"] == "oga" and
+        text_codec_fixture["codec_selector"] == "oga",
+        "deterministic fixture must keep OGA as the default codec selector")
+require(text_codec_fixture["parity"]["status"] in {"match", "mismatch", "error"} and
+        text_codec_fixture["parity"]["status"] != "not_run",
+        "wired external text-codec fixture must report real parity, not not_run")
+require(text_codec_fixture["parity"].get("equivalence_class") in {
+            "byte_exact", "canonical_equivalent", "structured_equivalent", "incompatible"},
+        "wired external text-codec fixture must record a decoder equivalence class")
+require(text_codec_fixture["parity"]["external_token_ids"] ==
+        text_codec_fixture["fixture"]["expected_token_ids"],
+        "wired external tokenizer evidence must contain callback-produced token ids")
+require(text_codec_fixture["parity"]["external_decoded_text"] ==
+        text_codec_fixture["fixture"]["expected_decoded_text"],
+        "wired external detokenizer evidence must contain callback-produced text")
+require(text_codec_fixture["detokenizer"]["status"] == "match" and
+        text_codec_fixture["detokenizer"]["final_text"] == text_codec_fixture["detokenizer"]["expected_text"],
+        "detokenizer fixture must prove final byte parity")
+require("".join(chunk["emitted_text"] for chunk in text_codec_fixture["detokenizer"]["chunk_emissions"]) ==
+        text_codec_fixture["detokenizer"]["final_text"],
+        "detokenizer fixture chunk emissions must concatenate to final text")
+require("fixture schema_version must be 1" in text_codec_validator,
+        "JSON contract validator must check fixture schema version")
+require("class ExternalTokenizerProbe" in external_tokenizer_header,
+        "missing callback-based external tokenizer probe")
+require("using TokenizeCallback" in external_tokenizer_header and
+        "std::function<std::vector<int>(std::string_view prompt)>" in external_tokenizer_header,
+        "external tokenizer probe must be callback-based")
+require("enum class TokenMismatchKind" in external_tokenizer_header and
+        "struct TokenMismatch" in external_tokenizer_header,
+        "external tokenizer probe must classify first mismatch kind")
+require("find_first_mismatch" in external_tokenizer_source and
+        "TokenMismatchKind::Length" in external_tokenizer_source,
+        "external tokenizer probe must detect count mismatches after a shared prefix")
+require("first mismatch must identify token index 1" in external_tokenizer_test and
+        "callback errors must report parity status error" in external_tokenizer_test,
+        "external tokenizer test must cover first mismatch and callback error paths")
+for forbidden_token in ("OgaGenerator", "OgaTokenizerStream", "GenerateNextToken",
+                        "GetSequenceData", "run_time_decoder"):
+    require(forbidden_token not in external_tokenizer_header + external_tokenizer_source + external_tokenizer_test,
+            f"tokenizer lane must not touch generation/decode token: {forbidden_token}")
+require("REQUIRED_MODEL_FAMILIES = {\"qwen2.5\", \"gemma\"}" in tokenizer_parity_tool,
+        "tokenizer parity tool must require Qwen and Gemma model-family coverage")
+require("build_callback_evidence" in tokenizer_parity_tool and
+        "first_token_mismatch" in tokenizer_parity_tool,
+        "tokenizer parity tool must write evidence and classify first token mismatch")
+case_categories = {case["category"] for case in tokenizer_text_cases["cases"]}
+for required_category in ("plain", "chat", "tool", "code", "whitespace", "cjk", "emoji", "added_tokens"):
+    require(required_category in case_categories,
+            f"tokenizer text fixture missing category: {required_category}")
+family_ids = {family["id"] for family in tokenizer_text_cases["model_families"]}
+require({"qwen2.5", "gemma"}.issubset(family_ids),
+        "tokenizer text fixture must cover Qwen and Gemma model families")
+for case in tokenizer_text_cases["cases"]:
+    require(case.get("capture_required") is True or "expected_oga_token_ids" in case,
+            f"tokenizer text fixture case must require capture or provide token IDs: {case.get('name')}")
 require("get_hip_oga_model_path" in model_list_hpp,
         "model_list cannot resolve HIP OGA package paths for tags")
 require("has_hip_oga_model_path" in model_list_hpp,
@@ -389,6 +509,43 @@ require("is_hip_oga_only_model(model_tag)" in model_downloader and
 require("offload_policy" in main_cpp and "policy_warning(offload_policy)" in main_cpp,
         "CLI check/list must report policy and warn for hybrid_gpu")
 
+for include_token in ("hip_oga_text_codec.hpp", "hip_oga_external_tokenizer.hpp"):
+    require(include_token in adapter,
+            f"HIP adapter must include external text-codec routing helper: {include_token}")
+require("template_provider_selector_" not in adapter and
+        "FLM_HIP_OGA_TEMPLATE_PROVIDER" not in adapter,
+        "HIP adapter must not expose a misleading OGA template provider selector for the FastFlowLM/minja frontend")
+for selector_member in ("tokenizer_provider_selector_", "decoder_provider_selector_"):
+    require(selector_member in adapter,
+            f"HIP adapter must keep an independent provider selector: {selector_member}")
+for env_name in ("FLM_HIP_OGA_TOKENIZER_PROVIDER", "FLM_HIP_OGA_DECODER_PROVIDER"):
+    require(
+        f'parse_text_codec_selector(flm::hip_oga::getenv_string("{env_name}"))' in adapter,
+        f"HIP adapter must parse default-off provider env var: {env_name}")
+require("FLM_HIP_OGA_TEXT_CODEC_COMPARE" in adapter and
+        "text_codec_compare_enabled_" in adapter,
+        "HIP adapter must expose an opt-in text-codec compare mode")
+require('"frontend=fastflowlm-minja"' in adapter and
+        "provider_signature(tokenizer_provider_selector_, decoder_provider_selector_" in adapter,
+        "HIP prefix-cache signatures must include the fixed frontend plus tokenizer/decoder provider identity")
+require("force_oga_text_providers_for_media" in adapter and
+        "media request forces HIP OGA text providers" in adapter,
+        "HIP adapter must force media requests through OGA text providers")
+require("encode_prompt_with_selected_provider" in adapter and
+        "decode_token_with_selected_provider" in adapter,
+        "HIP adapter must route tokenizer/decoder through independent selectors")
+for fail_closed_token in ("external tokenizer parity mismatch",
+                          "external decoder parity mismatch"):
+    require(fail_closed_token in adapter,
+            f"HIP adapter must fail closed on parity mismatch: {fail_closed_token}")
+require("ExternalTokenizerProbe" in adapter and
+        "ExternalCumulativeDetokenizer" in adapter and
+        "TextCodecParityResult" in adapter,
+        "HIP adapter must thread tokenizer/detokenizer parity diagnostics into compare mode")
+require("external text codec callbacks are not wired" not in adapter and
+        "ParityStatus::NotRun" not in adapter,
+        "HIP adapter compare mode must execute callbacks instead of reporting not_run")
+
 tokenizers_dir = ROOT / "third_party/tokenizers-cpp"
 expected_tokenizers_sha = git_output("rev-parse", "HEAD:third_party/tokenizers-cpp")
 actual_tokenizers_sha = (
@@ -450,6 +607,17 @@ require("auto_chat_engine->generate(meta_info, length_limit, ostream" in chat_st
 adapter_lower = adapter.lower()
 for token in ("open_npu_device", "flm_rt::device(", "xrt::", "amdxdna", ".xclbin", "xclbin_manager("):
     require(token not in adapter_lower, f"HIP adapter should not reference NPU runtime token: {token}")
+for token in ("TextCodecProvider", "parse_text_codec_selector",
+              "default_text_codec_selector"):
+    require(token in adapter,
+            f"HIP adapter must wire external text-codec selector path: {token}")
+for env_name in ("FLM_HIP_OGA_TOKENIZER_PROVIDER",
+                 "FLM_HIP_OGA_DECODER_PROVIDER", "FLM_HIP_OGA_TEXT_CODEC_COMPARE"):
+    require(env_name in hip_oga_docs,
+            f"HIP OGA docs must document external text-codec env var: {env_name}")
+require("FLM_HIP_OGA_TEMPLATE_PROVIDER" not in hip_oga_docs and
+        "FastFlowLM/minja" in hip_oga_docs,
+        "HIP OGA docs must describe the fixed FastFlowLM/minja frontend instead of a template selector")
 
 require("OgaConfig::Create" in adapter, "HIP adapter does not create OGA config")
 require("static OgaHandle handle" in adapter,
@@ -514,8 +682,25 @@ require("hip_oga_requested_max_tokens" in adapter and "configure_parameter" in a
         "HIP adapter must accept the per-request max token budget before insert/prefill")
 require("meta_info.generated_tokens >= length_limit" in adapter,
         "HIP adapter generation must count the first sampled token against --max-tokens")
-require("hip_engine->encode(templated_text)" in adapter,
-        "HIP adapter must encode prompts with the native OGA tokenizer")
+
+encode_prompt_helper = re.search(
+    r"std::vector<int>\s+encode_prompt_with_selected_provider\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}",
+    adapter,
+    re.S,
+)
+require(encode_prompt_helper is not None,
+        "HIP adapter must define the selected-provider prompt encode helper")
+encode_prompt_helper_body = encode_prompt_helper.group("body")
+require("ExternalTokenizerProbe" in encode_prompt_helper_body and
+        "hip_engine.encode(std::string(prompt))" in encode_prompt_helper_body and
+        "fastflowlm_tokenizer.encode(std::string(prompt))" in encode_prompt_helper_body and
+        "external_tokenizer_probe.compare(templated_text)" in encode_prompt_helper_body,
+        "HIP adapter tokenizer helper must compare OGA and FastFlowLM callback tokenization")
+require("describe_token_mismatch(tokenizer_parity)" in encode_prompt_helper_body and
+        "external tokenizer parity mismatch" in encode_prompt_helper_body,
+        "HIP adapter tokenizer helper must fail closed with first mismatch details")
+require("return parity.external_token_ids;" in encode_prompt_helper_body,
+        "HIP adapter direct external tokenizer mode must use external ids only after parity passes")
 require("hip_engine->begin_turn(tokens)" in adapter,
         "HIP adapter must append the full prompt through the native OGA generator")
 require("collect_hip_oga_image_inputs(input)" in adapter,
@@ -547,11 +732,38 @@ require("strict_gpu" in hip_oga_docs and "hybrid_gpu" in hip_oga_docs and
         "HIP OGA docs must document strict/hybrid policy and diagnostics")
 require("hip_engine->generate_next_token(sampled_token)" in adapter,
         "HIP adapter must consume OGA-generated token ids for user-visible text")
-require("hip_engine->decode_token(sampled_token)" in adapter,
-        "HIP adapter must decode generated tokens through the OGA tokenizer stream")
+
+decode_token_helper = re.search(
+    r"std::string\s+decode_token_with_selected_provider\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}",
+    adapter,
+    re.S,
+)
+require(decode_token_helper is not None,
+        "HIP adapter must define the selected-provider generated-token decode helper")
+decode_token_helper_body = decode_token_helper.group("body")
 hip_generate = adapter.split(
     "std::string HipOgaModel::generate(chat_meta_info_t& meta_info", 1)[1].split(
         "std::string HipOgaModel::generate_with_prompt", 1)[0]
+require("ExternalCumulativeDetokenizer" in hip_generate and
+        "fastflowlm_tokenizer.decode(token_ids)" in hip_generate,
+        "HIP adapter generate() must wire cumulative FastFlowLM decode callback")
+require("return hip_engine.decode_token(token);" in decode_token_helper_body and
+        "classify_decoder_text_equivalence" in hip_generate,
+        "HIP adapter decoder compare mode must route final text through the canonical-equivalence classifier")
+require("external cumulative decoded bytes diverged from OGA stream" not in hip_generate and
+        "native_decoded_text.rfind(external_decoder->emitted_text(), 0)" not in hip_generate,
+        "HIP adapter must not reject delayed-but-valid external cumulative decoder chunks")
+require("external_decoder->emitted_text() != native_decoded_text" not in hip_generate and
+        "final decoded bytes differ from OGA stream" not in hip_generate,
+        "HIP adapter must not use raw byte equality as the final plain-text pass gate")
+require("DecoderEquivalenceClass::Incompatible" in hip_generate and
+        "decoder equivalence incompatible" in hip_generate,
+        "HIP adapter must fail closed only after canonical decoder equivalence is incompatible")
+require("decode_preserving_standalone_metaspace_tokens" not in adapter and
+        "preserve_standalone_metaspace_tokens_for_oga" not in adapter,
+        "HIP adapter must not merge the diagnostic literal-metaspace reproduction behavior")
+require("return hip_engine.decode_token(token);" in decode_token_helper_body,
+        "HIP adapter must keep OGA token-stream decoding available for native authoritative output")
 require("sampler->sample" not in hip_generate,
         "HIP adapter generate() must not resample OGA logits through FastFlowLM")
 require("lm_engine->forward(sampled_token)" not in hip_generate,
@@ -604,6 +816,62 @@ if fixture.returncode != 0:
     sys.stderr.write(fixture.stdout)
     sys.stderr.write(fixture.stderr)
     raise SystemExit(fixture.returncode)
+
+contract = subprocess.run(
+    [sys.executable, str(ROOT / "src/test/hip_oga_backend_static/validate_hip_oga_text_codec_contract.py")],
+    cwd=ROOT,
+    text=True,
+    capture_output=True,
+)
+if contract.returncode != 0:
+    sys.stderr.write(contract.stdout)
+    sys.stderr.write(contract.stderr)
+    raise SystemExit(contract.returncode)
+
+tokenizer_parity = subprocess.run(
+    [sys.executable, str(ROOT / "src/test/hip_oga_external_codec/tokenizer_parity.py"), "--self-test"],
+    cwd=ROOT,
+    text=True,
+    capture_output=True,
+)
+if tokenizer_parity.returncode != 0:
+    sys.stderr.write(tokenizer_parity.stdout)
+    sys.stderr.write(tokenizer_parity.stderr)
+    raise SystemExit(tokenizer_parity.returncode)
+
+with tempfile.TemporaryDirectory(prefix="flm-hip-oga-text-codec-") as tmpdir:
+    text_codec_binary = Path(tmpdir) / (
+        "hip_oga_text_codec_test.exe" if os.name == "nt" else "hip_oga_text_codec_test")
+    compile_cmd = [
+        os.environ.get("CXX", "g++"),
+        "-std=c++20",
+        "-I",
+        str(ROOT / "src/include"),
+        str(ROOT / "src/test/hip_oga_backend_static/test_hip_oga_text_codec.cpp"),
+        "-o",
+        str(text_codec_binary),
+    ]
+    compile_result = subprocess.run(
+        compile_cmd,
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    )
+    if compile_result.returncode != 0:
+        sys.stderr.write(compile_result.stdout)
+        sys.stderr.write(compile_result.stderr)
+        raise SystemExit(compile_result.returncode)
+
+    text_codec_result = subprocess.run(
+        [str(text_codec_binary)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    )
+    if text_codec_result.returncode != 0:
+        sys.stderr.write(text_codec_result.stdout)
+        sys.stderr.write(text_codec_result.stderr)
+        raise SystemExit(text_codec_result.returncode)
 
 with tempfile.TemporaryDirectory(prefix="flm-hip-oga-tool-parser-") as tmpdir:
     parser_test = Path(tmpdir) / ("hip_oga_tool_parser_test.exe" if os.name == "nt" else "hip_oga_tool_parser_test")

@@ -49,6 +49,27 @@ $env:ORT_DISABLE_CPU_EP_FALLBACK = '1'
   --backend hip --ctx-len 512 --prompt Hi --max-tokens 1
 ```
 
+## Experimental FastFlowLM Tokenizer And Decoder
+
+This continuation adds the reviewed external text-codec experiment. To use the
+model's FastFlowLM/tokenizers-cpp bundle for prompt encoding and generated text:
+
+```powershell
+$env:FLM_HIP_OGA_TOKENIZER_PROVIDER = 'external'
+$env:FLM_HIP_OGA_DECODER_PROVIDER = 'external'
+Remove-Item Env:FLM_HIP_OGA_TEXT_CODEC_COMPARE -ErrorAction SilentlyContinue
+```
+
+Unset the two providers or set them to `oga` to use the default OGA codec.
+Setting `FLM_HIP_OGA_TEXT_CODEC_COMPARE=1` instead keeps OGA in control and
+compares the FastFlowLM results. The template remains FastFlowLM/minja and OGA
+continues to generate every token in all modes. Direct external mode still uses
+OGA codec calls for parity checks; it is not a tokenizer-free OGA runtime.
+
+Reconfigure CMake before building an existing build directory so the new codec
+source is discovered. The [evaluation report](docs/architecture/hip-oga-token-boundary-evaluation.md)
+separates the tested text models, VLM coverage, and open qualification gaps.
+
 ## Experimental Prefix Cache
 
 The text prefix cache is off by default. Enable it only for an experimental

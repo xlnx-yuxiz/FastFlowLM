@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "codec_selector": "oga",
+  "default_provider": "oga",
+  "fixture": {
+    "id": "basic-ascii-hello-v1",
+    "description": "No-hardware deterministic text-codec fixture for selector and evidence plumbing.",
+    "prompt": "Hello",
+    "normalized_prompt": "Hello",
+    "expected_token_ids": [
+      9906
+    ],
+    "expected_decoded_text": "Hello",
+    "determinism": {
+      "temperature": 0,
+      "top_p": 1,
+      "max_new_tokens": 0
+    }
+  },
+  "parity": {
+    "status": "match",
+    "equivalence_class": "byte_exact",
+    "raw_byte_equal": true,
+    "valid_utf8": true,
+    "special_token_leakage": false,
+    "first_mismatch": null,
+    "normalization_applied": [],
+    "oga_provider": "oga",
+    "external_provider": "external",
+    "oga_token_ids": [
+      9906
+    ],
+    "external_token_ids": [
+      9906
+    ],
+    "oga_decoded_text": "Hello",
+    "external_decoded_text": "Hello",
+    "notes": "External tokenizer and cumulative detokenizer callbacks execute and match the OGA oracle for this deterministic no-hardware fixture."
+  },
+  "detokenizer": {
+    "status": "match",
+    "mode": "callback_cumulative",
+    "input_token_ids": [
+      9906
+    ],
+    "chunk_emissions": [
+      {
+        "token_ids": [
+          9906
+        ],
+        "cumulative_text": "Hello",
+        "emitted_text": "",
+        "final": false
+      },
+      {
+        "token_ids": [
+          9906
+        ],
+        "cumulative_text": "Hello",
+        "emitted_text": "Hello",
+        "final": true
+      }
+    ],
+    "final_text": "Hello",
+    "expected_text": "Hello",
+    "notes": "External detokenizer lane fixture proves callback-cumulative final and chunk byte parity without routing through the FastFlowLM native runtime decoder."
+  }
+}

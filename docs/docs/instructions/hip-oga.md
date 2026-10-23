@@ -224,6 +224,74 @@ provider options through `OgaConfig::Overlay()` for every present OGA pipeline
 section (`decoder`, `embedding`, `vision`, and `speech`) before creating the
 model. It does not rely on `AppendProvider("AMDGPU")` for the HIP EP path.
 
+## External Text Codec Selectors
+
+HIP OGA defaults to the OGA tokenizer and decoder; external selection is opt-in. The chat
+template frontend is fixed to FastFlowLM/minja because `HipOgaModel` owns
+`apply_chat_template()` through the FastFlowLM tokenizer config, not an OGA
+template callback. The tokenizer and decoder selectors are independent so an
+external provider can be compared or enabled one lane at a time:
+
+```shell
+export FLM_HIP_OGA_TOKENIZER_PROVIDER=oga
+export FLM_HIP_OGA_DECODER_PROVIDER=oga
+export FLM_HIP_OGA_TEXT_CODEC_COMPARE=1
+```
+
+Unset selector variables, `default`, `oga`, and `native-oga` all select the
+native OGA provider. `FLM_HIP_OGA_TEXT_CODEC_COMPARE=1` executes the
+FastFlowLM external tokenizer callback (`Tokenizer::encode`) against
+`HipOgaCausalLm::encode` and keeps OGA prompt IDs authoritative. Setting
+`FLM_HIP_OGA_TOKENIZER_PROVIDER=external` is a lab-only direct mode: it still
+compares both callbacks first, fails closed on any first mismatch, and feeds
+external IDs to OGA only after request-level parity passes.
+
+To use FastFlowLM for both prompt IDs and output text, disable compare mode:
+
+```powershell
+$env:FLM_HIP_OGA_TOKENIZER_PROVIDER = 'external'
+$env:FLM_HIP_OGA_DECODER_PROVIDER = 'external'
+Remove-Item Env:FLM_HIP_OGA_TEXT_CODEC_COMPARE -ErrorAction SilentlyContinue
+```
+
+`external` selects FastFlowLM/tokenizers-cpp using the current model's tokenizer
+bundle. `fflm` and `flm` are not accepted selector values. Compare mode takes
+precedence over the provider selectors: when it is enabled, OGA IDs and output
+remain authoritative even if a selector says `external`.
+
+Direct external mode still creates and calls the OGA tokenizer/decoder as a
+runtime parity oracle. It does not remove the OGA tokenizer dependency. There
+is no independent chat-template provider selector.
+
+Decoder compare mode feeds only native OGA generated token IDs into
+`ExternalCumulativeDetokenizer`, whose callback is cumulative
+`Tokenizer::decode(vector<int>)`. OGA token selection and generation remain
+authoritative. Setting `FLM_HIP_OGA_DECODER_PROVIDER=external` is likewise a
+lab-only direct mode: it compares concatenated final text after the cumulative
+decoder finishes. Raw byte equality is recorded as a diagnostic class, not the
+only pass gate.
+
+Plain-text decoder parity uses four classes: `byte_exact`,
+`canonical_equivalent`, `structured_equivalent`, and `incompatible`.
+`byte_exact` is the expected result for Qwen-style runs. Gemma/SentencePiece
+runs may be `canonical_equivalent` when the tokenizer/model contract explicitly
+identifies Gemma plus a metaspace decoder and the only visible difference is
+standalone `U+2581` rendered as a normal user-visible space. FastFlowLM records
+the raw OGA stream, OGA full decode, FastFlowLM full decode, external cumulative
+decode, token IDs, hashes, first mismatch, and normalization applied when
+`FLM_HIP_OGA_DECODER_DISCRIMINATOR_JSON` is set.
+
+Structured JSON/tool/code-like outputs stay strict. Parsed JSON may classify as
+`structured_equivalent` for formatting-only differences, but string values are
+not text-normalized; tool-call markup and code blocks must be byte-exact or
+they are incompatible. Image and other media turns force the tokenizer and
+decoder providers back to OGA because the OGA multimodal processor owns media
+tokenization. With compare mode enabled, the external decoder comparison still
+runs for media even though OGA supplies the output, and a comparison failure can
+abort the request. This experimental path has only bounded, model-specific VLM
+coverage. See the [token-boundary evaluation](../../architecture/hip-oga-token-boundary-evaluation.md)
+for the recovered evidence and remaining limitations.
+
 ## Experimental Text Prefix Cache
 
 HIP OGA prompt KV reuse is off by default. Enable the experimental sequential

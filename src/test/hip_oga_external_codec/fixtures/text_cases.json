@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "description": "Deterministic no-hardware text cases for HIP OGA external tokenizer parity capture.",
+  "model_families": [
+    {
+      "id": "qwen2.5",
+      "tokenizer_family": "byte-level-bpe",
+      "representative_tags": [
+        "hip-qwen2.5:14b",
+        "hip-qwen2.5-coder:14b"
+      ],
+      "capture_required": true
+    },
+    {
+      "id": "gemma",
+      "tokenizer_family": "sentencepiece",
+      "representative_tags": [
+        "hip-gemma3:4b"
+      ],
+      "capture_required": true
+    }
+  ],
+  "cases": [
+    {
+      "name": "plain_ascii_instruction",
+      "category": "plain",
+      "template_mode": "raw",
+      "model_families": [
+        "qwen2.5",
+        "gemma"
+      ],
+      "capture_required": true,
+      "text": "Summarize FastFlowLM tokenizer parity in one sentence."
+    },
+    {
+      "name": "minimal_chat_turn",
+      "category": "chat",
+      "template_mode": "chat",
+      "model_families": [
+        "qwen2.5",
+        "gemma"
+      ],
+      "capture_required": true,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You answer with concise engineering facts."
+        },
+        {
+          "role": "user",
+          "content": "What should own tokenization?"
+        }
+      ]
+    },
+    {
+      "name": "tool_call_json_arguments",
+      "category": "tool",
+      "template_mode": "chat_tools",
+      "model_families": [
+        "qwen2.5",
+        "gemma"
+      ],
+      "capture_required": true,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Look up the GPU profile for qwen."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_gpu_profile",
+            "description": "Return the HIP OGA package profile.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "python_code_block",
+      "category": "code",
+      "template_mode": "raw",
+      "model_families": [
+        "qwen2.5",
+        "gemma"
+      ],
+      "capture_required": true,
+      "text": "```python\ndef add(a, b):\n    return a + b\nprint(add(2, 3))\n```"
+    },
+    {
+      "name": "whitespace_newline_edges",
+      "category": "whitespace",
+      "template_mode": "raw",
+      "model_families": [
+        "qwen2.5",
+        "gemma"
+      ],
+      "capture_required": true,
+      "text": "  leading spaces\n\nmiddle\twith\ttabs\ntrailing spaces  "
+    },
+    {
+      "name": "cjk_mixed_prompt",
+      "category": "cjk",
+      "template_mode": "raw",
+      "model_families": [
+        "qwen2.5",
+        "gemma"
+      ],
+      "capture_required": true,
+      "text": "请用中文解释 HIP EP tokenizer parity。"
+    },
+    {
+      "name": "emoji_combining_marks",
+      "category": "emoji",
+      "template_mode": "raw",
+      "model_families": [
+        "qwen2.5",
+        "gemma"
+      ],
+      "capture_required": true,
+      "text": "Café ☕ 🚀 tokenizer check"
+    },
+    {
+      "name": "added_chat_tokens_literal",
+      "category": "added_tokens",
+      "template_mode": "raw",
+      "model_families": [
+        "qwen2.5",
+        "gemma"
+      ],
+      "capture_required": true,
+      "text": "<|im_start|>user\nHello<|im_end|>\n<start_of_turn>model\nHi<end_of_turn>"
+    }
+  ]
+}

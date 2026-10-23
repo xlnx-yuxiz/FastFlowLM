@@ -1,7 +1,9 @@
 /// \file hip_oga_model.cpp
 /// \brief Prototype AutoModel backed by ONNX Runtime GenAI over HIP EP
 #include "AutoModel/hip_oga_model.hpp"
+#include "AutoModel/hip_oga_external_tokenizer.hpp"
 #include "AutoModel/hip_oga_prefix_cache.hpp"
+#include "AutoModel/hip_oga_text_codec.hpp"
 #include "AutoModel/hip_oga_tool_parser.hpp"
 #include "base64.hpp"
 #include "hip_oga_policy.hpp"
@@ -17,9 +19,11 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cctype>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -58,6 +62,52 @@ nlohmann::json read_json_file_if_present(const std::filesystem::path& path) {
         return nlohmann::json::object();
     }
     return parsed;
+}
+
+flm::hip_oga::DecoderCanonicalizationPolicy decoder_policy_for_model(
+    const std::filesystem::path& model_root,
+    const nlohmann::json& tokenizer_config) {
+    return flm::hip_oga::decoder_policy_from_tokenizer_contract(
+        tokenizer_config,
+        read_json_file_if_present(model_root / "tokenizer.json"));
+}
+
+std::string trim_copy(std::string_view text) {
+    auto begin = text.begin();
+    auto end = text.end();
+    while (begin != end && std::isspace(static_cast<unsigned char>(*begin))) ++begin;
+    while (begin != end && std::isspace(static_cast<unsigned char>(*(end - 1)))) --end;
+    return std::string(begin, end);
+}
+
+bool looks_like_strict_structured_decoder_text(const std::string& text) {
+    const std::string trimmed = trim_copy(text);
+    if (trimmed.empty()) return false;
+    if (trimmed.front() == '{' || trimmed.front() == '[') return true;
+    return trimmed.rfind("```", 0) == 0 ||
+        trimmed.rfind("<tool_call>", 0) == 0 ||
+        trimmed.find("</tool_call>") != std::string::npos;
+}
+
+std::string fnv1a64_hex(std::string_view text) {
+    std::uint64_t hash = 14695981039346656037ull;
+    for (unsigned char ch : text) {
+        hash ^= static_cast<std::uint64_t>(ch);
+        hash *= 1099511628211ull;
+    }
+    std::ostringstream out;
+    out << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return out.str();
+}
+
+nlohmann::ordered_json mismatch_to_json(
+    const std::optional<flm::hip_oga::TextMismatchEvidence>& mismatch) {
+    if (!mismatch.has_value()) return nullptr;
+    return nlohmann::ordered_json{
+        {"byte_index", mismatch->byte_index},
+        {"oga_text_window_b64", base64::to_base64(mismatch->oga_text_window)},
+        {"external_text_window_b64",
+         base64::to_base64(mismatch->external_text_window)}};
 }
 
 template <typename JsonObject>
@@ -124,6 +174,62 @@ void append_token_ids(std::vector<int>& out, const nlohmann::json& value) {
     } else if (value.is_number_integer() || value.is_number_unsigned()) {
         out.push_back(value.get<int>());
     }
+}
+
+std::string decoder_discriminator_capture_path() {
+    const char* path = std::getenv("FLM_HIP_OGA_DECODER_DISCRIMINATOR_JSON");
+    return path == nullptr ? std::string() : std::string(path);
+}
+
+void write_decoder_discriminator_capture(
+    const std::string& path,
+    const std::vector<int>& generated_token_ids,
+    const std::vector<int>& decoder_token_ids,
+    const std::string& oga_stream_text,
+    const std::string& oga_full_decoded_text,
+    const std::string& fastflowlm_full_decoded_text,
+    const std::string& external_emitted_text,
+    const flm::hip_oga::DecoderCanonicalizationPolicy& policy,
+    const flm::hip_oga::DecoderEquivalenceResult& equivalence) {
+    if (path.empty()) return;
+
+    nlohmann::ordered_json capture;
+    capture["generated_token_ids"] = generated_token_ids;
+    capture["decoder_token_ids"] = decoder_token_ids;
+    capture["oga_stream_b64"] = base64::to_base64(oga_stream_text);
+    capture["oga_full_decode_b64"] = base64::to_base64(oga_full_decoded_text);
+    capture["fastflowlm_full_decode_b64"] = base64::to_base64(fastflowlm_full_decoded_text);
+    capture["external_cumulative_emitted_b64"] = base64::to_base64(external_emitted_text);
+    capture["hash_algorithm"] = "fnv1a64";
+    capture["hashes"] = nlohmann::ordered_json{
+        {"oga_stream", fnv1a64_hex(oga_stream_text)},
+        {"oga_full_decode", fnv1a64_hex(oga_full_decoded_text)},
+        {"fastflowlm_full_decode", fnv1a64_hex(fastflowlm_full_decoded_text)},
+        {"external_cumulative_emitted", fnv1a64_hex(external_emitted_text)}};
+    capture["decoder_equivalence_class"] =
+        flm::hip_oga::to_string(equivalence.equivalence_class);
+    capture["decoder_contract"] = policy.contract_name;
+    capture["decoder_equivalence_mode"] = flm::hip_oga::to_string(policy.mode);
+    capture["raw_byte_equal"] = equivalence.raw_byte_equal;
+    capture["valid_utf8"] = equivalence.valid_utf8;
+    capture["special_token_leakage"] = equivalence.special_token_leakage;
+    capture["first_mismatch"] = mismatch_to_json(equivalence.first_mismatch);
+    capture["normalization_applied"] = equivalence.normalization_applied;
+    capture["oga_canonical_text_b64"] =
+        base64::to_base64(equivalence.oga_canonical_text);
+    capture["external_canonical_text_b64"] =
+        base64::to_base64(equivalence.external_canonical_text);
+
+    const std::filesystem::path capture_path(path);
+    if (capture_path.has_parent_path()) {
+        std::filesystem::create_directories(capture_path.parent_path());
+    }
+    std::ofstream out(capture_path, std::ios::out | std::ios::binary);
+    if (!out.is_open()) {
+        throw std::runtime_error(
+            "Could not open HIP OGA decoder discriminator capture path: " + path);
+    }
+    out << capture.dump(2) << '\n';
 }
 
 StreamEventType to_auto_stream_type(flm::hip_oga::StreamEventType type) {
@@ -210,6 +316,99 @@ constexpr std::uint32_t kHipOgaSharedGenerateLookaheadTokens = 1;
 bool hip_oga_prefix_cache_enabled() {
     return flm::hip_oga::prefix_cache_env_enabled(
         std::getenv("FLM_HIP_OGA_PREFIX_CACHE"));
+}
+
+bool is_external_provider(const flm::hip_oga::TextCodecSelector& selector) {
+    return selector.provider == flm::hip_oga::TextCodecProvider::External;
+}
+
+std::string provider_signature(
+    const flm::hip_oga::TextCodecSelector& tokenizer_provider_selector,
+    const flm::hip_oga::TextCodecSelector& decoder_provider_selector,
+    const std::string& tokenizer_fingerprint) {
+    std::ostringstream signature;
+    signature << "frontend=fastflowlm-minja"
+              << ";tokenizer=" << tokenizer_provider_selector.normalized_name
+              << ";decoder=" << decoder_provider_selector.normalized_name
+              << ";tokenizer_fingerprint=" << tokenizer_fingerprint;
+    return signature.str();
+}
+
+std::string tokenizer_fingerprint_for_model(const std::string& model_path) {
+    static constexpr const char* kTokenizerFiles[] = {
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json",
+        "vocab.json",
+        "merges.txt",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+    };
+
+    const std::filesystem::path model_root(model_path);
+    std::ostringstream fingerprint;
+    for (const char* filename : kTokenizerFiles) {
+        const auto path = model_root / filename;
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec) || ec) continue;
+        const auto size = std::filesystem::file_size(path, ec);
+        if (ec) continue;
+        const auto write_time = std::filesystem::last_write_time(path, ec);
+        if (ec) continue;
+        fingerprint << filename << ":" << size << ":"
+                    << write_time.time_since_epoch().count() << ";";
+    }
+    const std::string value = fingerprint.str();
+    return value.empty() ? "none" : value;
+}
+
+std::string describe_token_mismatch(
+    const flm::hip_oga::ExternalTokenizerProbeResult& parity) {
+    if (!parity.first_mismatch.has_value()) return parity.notes;
+    const auto& mismatch = *parity.first_mismatch;
+    std::ostringstream message;
+    message << "first_mismatch_kind=" << flm::hip_oga::to_string(mismatch.kind)
+            << " index=" << mismatch.index
+            << " oga_token_id=" << mismatch.oga_token_id
+            << " external_token_id=" << mismatch.external_token_id;
+    return message.str();
+}
+
+flm::hip_oga::TextCodecParityResult to_text_codec_parity_result(
+    const flm::hip_oga::ExternalTokenizerProbeResult& tokenizer_parity) {
+    flm::hip_oga::TextCodecParityResult parity;
+    parity.status = tokenizer_parity.status;
+    parity.prompt = tokenizer_parity.prompt;
+    parity.oga_token_ids = tokenizer_parity.oga_token_ids;
+    parity.external_token_ids = tokenizer_parity.external_token_ids;
+    parity.notes = tokenizer_parity.first_mismatch.has_value()
+        ? describe_token_mismatch(tokenizer_parity)
+        : tokenizer_parity.notes;
+    return parity;
+}
+
+void log_text_codec_parity(
+    const char* lane,
+    const flm::hip_oga::TextCodecParityResult& parity) {
+    header_print("FLM", std::string("HIP OGA external ") + lane +
+        " parity status=" + flm::hip_oga::to_string(parity.status) +
+        " oga_tokens=" +
+        flm::hip_oga::join_token_ids_for_evidence(parity.oga_token_ids) +
+        " external_tokens=" +
+        flm::hip_oga::join_token_ids_for_evidence(parity.external_token_ids) +
+        (parity.notes.empty() ? std::string() : " notes=" + parity.notes));
+}
+
+void force_oga_text_providers_for_media(
+    flm::hip_oga::TextCodecSelector& tokenizer_provider_selector,
+    flm::hip_oga::TextCodecSelector& decoder_provider_selector) {
+    if (!is_external_provider(tokenizer_provider_selector) &&
+        !is_external_provider(decoder_provider_selector)) {
+        return;
+    }
+    header_print("FLM", "media request forces HIP OGA text providers");
+    tokenizer_provider_selector = flm::hip_oga::default_text_codec_selector();
+    decoder_provider_selector = flm::hip_oga::default_text_codec_selector();
 }
 
 std::string get_hip_oga_string(const nlohmann::ordered_json& model_info,
@@ -782,6 +981,16 @@ public:
         return decoded == nullptr ? std::string() : std::string(decoded);
     }
 
+    std::string decode_tokens(const std::vector<int>& tokens) const {
+        if (!tokenizer_) {
+            throw std::runtime_error("HIP OGA tokenizer is not initialized");
+        }
+        const auto converted = to_int32_tokens(tokens);
+        const auto decoded = tokenizer_->Decode(converted.data(), converted.size());
+        const char* decoded_text = decoded;
+        return decoded_text == nullptr ? std::string() : std::string(decoded_text);
+    }
+
 private:
     std::uint32_t effective_oga_max_length(std::size_t prompt_token_count) const {
         const std::uint64_t requested_max_tokens = requested_max_tokens_;
@@ -900,6 +1109,52 @@ private:
     std::size_t checkpoint_token_count_ = 0;
 };
 
+std::vector<int> encode_prompt_with_selected_provider(
+    HipOgaCausalLm& hip_engine,
+    Tokenizer& fastflowlm_tokenizer,
+    const std::string& templated_text,
+    const flm::hip_oga::TextCodecSelector& tokenizer_provider_selector,
+    bool text_codec_compare_enabled) {
+    const bool external_selected = is_external_provider(tokenizer_provider_selector);
+    if (!external_selected && !text_codec_compare_enabled) {
+        return hip_engine.encode(templated_text);
+    }
+
+    flm::hip_oga::ExternalTokenizerProbe external_tokenizer_probe(
+        [&](std::string_view prompt) {
+            return hip_engine.encode(std::string(prompt));
+        },
+        [&](std::string_view prompt) {
+            return fastflowlm_tokenizer.encode(std::string(prompt));
+        });
+    const auto tokenizer_parity =
+        external_tokenizer_probe.compare(templated_text);
+    auto parity = to_text_codec_parity_result(tokenizer_parity);
+    log_text_codec_parity("tokenizer", parity);
+
+    if (tokenizer_parity.status == flm::hip_oga::ParityStatus::Error) {
+        throw std::runtime_error(
+            "HIP OGA external tokenizer parity error: " +
+            tokenizer_parity.notes);
+    }
+    if (!tokenizer_parity.matches()) {
+        throw std::runtime_error(
+            "HIP OGA external tokenizer parity mismatch: " +
+            describe_token_mismatch(tokenizer_parity));
+    }
+
+    if (external_selected && !text_codec_compare_enabled) {
+        return parity.external_token_ids;
+    }
+    return parity.oga_token_ids;
+}
+
+std::string decode_token_with_selected_provider(
+    HipOgaCausalLm& hip_engine,
+    int token) {
+    return hip_engine.decode_token(token);
+}
+
 }  // namespace
 
 HipOgaModel::HipOgaModel() : AutoModel(nullptr, "HIP OGA") {
@@ -944,6 +1199,21 @@ void HipOgaModel::load_model(std::string model_path,
     this->tool_start_token_id_ = -1;
     this->prefix_cache_.reset_session();
     this->prefix_cache_request_signature_ = "{}";
+    this->tokenizer_fingerprint_ =
+        tokenizer_fingerprint_for_model(this->model_path);
+    this->tokenizer_provider_selector_ =
+        flm::hip_oga::parse_text_codec_selector(flm::hip_oga::getenv_string("FLM_HIP_OGA_TOKENIZER_PROVIDER"));
+    this->decoder_provider_selector_ =
+        flm::hip_oga::parse_text_codec_selector(flm::hip_oga::getenv_string("FLM_HIP_OGA_DECODER_PROVIDER"));
+    this->active_decoder_provider_selector_ = this->decoder_provider_selector_;
+    this->text_codec_compare_enabled_ =
+        flm::hip_oga::getenv_flag_enabled("FLM_HIP_OGA_TEXT_CODEC_COMPARE");
+    const std::string configured_provider_signature =
+        provider_signature(tokenizer_provider_selector_, decoder_provider_selector_,
+                           this->tokenizer_fingerprint_);
+    if (this->text_codec_compare_enabled_) {
+        header_print("FLM", "HIP OGA text codec selectors " + configured_provider_signature);
+    }
 
     try {
         this->tokenizer = std::make_unique<Tokenizer>(this->model_path);
@@ -953,6 +1223,15 @@ void HipOgaModel::load_model(std::string model_path,
         if (tokenizer_config.empty()) {
             throw std::runtime_error("Cannot open " +
                                      (model_root / "tokenizer_config.json").string());
+        }
+        this->decoder_canonicalization_policy_ =
+            decoder_policy_for_model(model_root, tokenizer_config);
+        if (this->text_codec_compare_enabled_ &&
+            this->decoder_canonicalization_policy_.gemma_standalone_metaspace_is_space) {
+            header_print(
+                "FLM",
+                "HIP OGA decoder canonicalization contract=" +
+                    this->decoder_canonicalization_policy_.contract_name);
         }
 
         const auto chat_template_path = model_root / "chat_template.jinja";
@@ -1064,6 +1343,13 @@ bool HipOgaModel::insert(chat_meta_info_t& meta_info,
     reject_hip_oga_audio_inputs(input);
     const std::vector<HipOgaImageInput> images =
         collect_hip_oga_image_inputs(input);
+    auto tokenizer_provider_selector = this->tokenizer_provider_selector_;
+    auto decoder_provider_selector = this->decoder_provider_selector_;
+    if (!images.empty()) {
+        force_oga_text_providers_for_media(tokenizer_provider_selector,
+                                           decoder_provider_selector);
+    }
+    this->active_decoder_provider_selector_ = decoder_provider_selector;
 
     this->profiler_list[TKOEN_ENCODE_TIME].start();
     std::string templated_text;
@@ -1082,7 +1368,12 @@ bool HipOgaModel::insert(chat_meta_info_t& meta_info,
 
     std::size_t prompt_tokens = 0;
     if (images.empty()) {
-        std::vector<int> tokens = hip_engine->encode(templated_text);
+        std::vector<int> tokens = encode_prompt_with_selected_provider(
+            *hip_engine,
+            *this->tokenizer,
+            templated_text,
+            tokenizer_provider_selector,
+            this->text_codec_compare_enabled_);
         this->profiler_list[TKOEN_ENCODE_TIME].stop(tokens.size());
 
         if (is_cancelled()) {
@@ -1096,8 +1387,14 @@ bool HipOgaModel::insert(chat_meta_info_t& meta_info,
 
         const auto required_capacity =
             hip_engine->native_text_required_max_length(tokens.size());
+        const std::string text_codec_signature =
+            provider_signature(tokenizer_provider_selector,
+                               decoder_provider_selector,
+                               this->tokenizer_fingerprint_);
         const std::string signature =
-            hip_engine->prefix_cache_signature(prefix_cache_request_signature_);
+            hip_engine->prefix_cache_signature(prefix_cache_request_signature_ +
+                                               ";text_codec=" +
+                                               text_codec_signature);
         auto cache_decision = prefix_cache_.evaluate(
             hip_oga_prefix_cache_enabled(),
             meta_info.restore_allowed,
@@ -1193,6 +1490,34 @@ std::string HipOgaModel::generate(chat_meta_info_t& meta_info,
     this->profiler_list[TKOEN_DECODE_TIME].reset();
     hip_engine->reset_decoder_stream();
 
+    const bool external_decoder_selected =
+        is_external_provider(this->active_decoder_provider_selector_);
+    const bool compare_external_decoder =
+        this->text_codec_compare_enabled_ || external_decoder_selected;
+    const bool use_external_decoder_output =
+        external_decoder_selected && !this->text_codec_compare_enabled_;
+    std::string native_decoded_text;
+    std::vector<int> generated_token_ids;
+    std::vector<int> decoder_token_ids;
+    std::unique_ptr<flm::hip_oga::ExternalCumulativeDetokenizer> external_decoder;
+    if (compare_external_decoder) {
+        Tokenizer& fastflowlm_tokenizer = *this->tokenizer;
+        external_decoder =
+            std::make_unique<flm::hip_oga::ExternalCumulativeDetokenizer>(
+                [&](const std::vector<int>& token_ids) {
+                    try {
+                        return flm::hip_oga::CumulativeDecodeResult::match(
+                            fastflowlm_tokenizer.decode(token_ids));
+                    } catch (const std::exception& e) {
+                        return flm::hip_oga::CumulativeDecodeResult::error(
+                            e.what());
+                    } catch (...) {
+                        return flm::hip_oga::CumulativeDecodeResult::error(
+                            "unknown FastFlowLM cumulative decode error");
+                    }
+                });
+    }
+
     while (this->total_tokens < this->MAX_L) {
         if ((length_limit > 0) && (meta_info.generated_tokens >= length_limit)) {
             reason = MAX_LENGTH_REACHED;
@@ -1220,6 +1545,7 @@ std::string HipOgaModel::generate(chat_meta_info_t& meta_info,
 
         this->last_token = sampled_token;
         this->token_history.push_back(sampled_token);
+        generated_token_ids.push_back(sampled_token);
         this->total_tokens++;
 
         if (this->is_eos(sampled_token)) {
@@ -1227,9 +1553,30 @@ std::string HipOgaModel::generate(chat_meta_info_t& meta_info,
             break;
         }
 
+        decoder_token_ids.push_back(sampled_token);
         this->profiler_list[TKOEN_DECODE_TIME].start();
+        std::string token_str;
         if (this->is_normal_token(sampled_token)) {
-            std::string token_str = hip_engine->decode_token(sampled_token);
+            token_str = decode_token_with_selected_provider(*hip_engine,
+                                                            sampled_token);
+            native_decoded_text += token_str;
+        }
+        if (external_decoder) {
+            const auto external_chunk =
+                external_decoder->append_token(sampled_token);
+            if (external_chunk.status != flm::hip_oga::ParityStatus::Match) {
+                throw std::runtime_error(
+                    "HIP OGA external decoder parity mismatch: " +
+                    external_chunk.notes);
+            }
+            if (use_external_decoder_output) {
+                os << external_chunk.emitted_text << std::flush;
+                result += external_chunk.emitted_text;
+            } else if (!token_str.empty()) {
+                os << token_str << std::flush;
+                result += token_str;
+            }
+        } else if (!token_str.empty()) {
             os << token_str << std::flush;
             result += token_str;
         }
@@ -1244,6 +1591,75 @@ std::string HipOgaModel::generate(chat_meta_info_t& meta_info,
             reason = MAX_LENGTH_REACHED;
             break;
         }
+    }
+
+    if (external_decoder && reason != CANCEL_DETECTED) {
+        const auto final_chunk = external_decoder->finish();
+        if (final_chunk.status != flm::hip_oga::ParityStatus::Match) {
+            throw std::runtime_error(
+                "HIP OGA external decoder parity mismatch: " +
+                final_chunk.notes);
+        }
+        const std::string capture_path = decoder_discriminator_capture_path();
+        std::string oga_full_decoded_text = native_decoded_text;
+        std::string fastflowlm_full_decoded_text = external_decoder->emitted_text();
+        const bool raw_decoder_bytes_differ =
+            !(external_decoder->emitted_text() == native_decoded_text);
+        if (!capture_path.empty() || raw_decoder_bytes_differ) {
+            oga_full_decoded_text = hip_engine->decode_tokens(decoder_token_ids);
+            fastflowlm_full_decoded_text =
+                this->tokenizer->decode(decoder_token_ids);
+        }
+
+        auto decoder_policy = this->decoder_canonicalization_policy_;
+        if (looks_like_strict_structured_decoder_text(oga_full_decoded_text) ||
+            looks_like_strict_structured_decoder_text(fastflowlm_full_decoded_text)) {
+            decoder_policy.mode =
+                flm::hip_oga::DecoderEquivalenceMode::StructuredJson;
+            decoder_policy.gemma_standalone_metaspace_is_space = false;
+            decoder_policy.contract_name = "structured_no_text_normalization";
+        }
+        const auto decoder_equivalence =
+            flm::hip_oga::classify_decoder_text_equivalence(
+                oga_full_decoded_text,
+                fastflowlm_full_decoded_text,
+                decoder_policy);
+
+        if (!capture_path.empty()) {
+            write_decoder_discriminator_capture(
+                capture_path,
+                generated_token_ids,
+                decoder_token_ids,
+                native_decoded_text,
+                oga_full_decoded_text,
+                fastflowlm_full_decoded_text,
+                external_decoder->emitted_text(),
+                decoder_policy,
+                decoder_equivalence);
+            header_print("FLM",
+                         "HIP OGA decoder discriminator capture=" +
+                             capture_path);
+        }
+        if (decoder_equivalence.equivalence_class ==
+            flm::hip_oga::DecoderEquivalenceClass::Incompatible) {
+            throw std::runtime_error(
+                "HIP OGA external decoder parity mismatch: decoder equivalence incompatible: " +
+                decoder_equivalence.notes);
+        }
+        if (use_external_decoder_output && !final_chunk.emitted_text.empty()) {
+            os << final_chunk.emitted_text << std::flush;
+            result += final_chunk.emitted_text;
+        }
+
+        flm::hip_oga::TextCodecParityResult parity;
+        parity.status = flm::hip_oga::ParityStatus::Match;
+        parity.oga_decoded_text = oga_full_decoded_text;
+        parity.external_decoded_text = fastflowlm_full_decoded_text;
+        header_print("FLM", "HIP OGA external decoder parity status=" +
+            flm::hip_oga::to_string(parity.status) +
+            " equivalence=" +
+            flm::hip_oga::to_string(decoder_equivalence.equivalence_class) +
+            " bytes=" + std::to_string(parity.external_decoded_text.size()));
     }
 
     meta_info.decoding_duration =
