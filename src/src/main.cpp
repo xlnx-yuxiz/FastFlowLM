@@ -505,6 +505,20 @@ int main(int argc, char* argv[]) {
     const bool using_hip_oga =
         flm::backend::is_hip_oga_backend(parsed_args.backend);
 
+    try {
+        if (!using_hip_oga && (!parsed_args.hip_oga_text_codec.empty() ||
+            !parsed_args.hip_oga_tokenizer.empty() || !parsed_args.hip_oga_decoder.empty())) {
+            throw std::invalid_argument("HIP codec options require --backend hip");
+        }
+        if (using_hip_oga) {
+            flm::hip_oga::apply_text_codec_cli_options(parsed_args.hip_oga_text_codec,
+                parsed_args.hip_oga_tokenizer, parsed_args.hip_oga_decoder);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+
 #if !defined(_WIN32) && !defined(FLM_USE_HRX)
     if (!using_hip_oga) {
         // XRT backend: preload bundled XRT libraries from the executable directory.

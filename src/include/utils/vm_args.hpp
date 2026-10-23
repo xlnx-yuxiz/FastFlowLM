@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <vector>
 #include "program_args.hpp"
+#include "AutoModel/hip_oga_codec_options.hpp"
 
 namespace arg_utils {
 
@@ -94,6 +95,12 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
              "Set context length")
             ("backend", po::value<std::string>(&parsed_args.backend)->default_value(""),
              "Execution backend: npu (default) or hip. The hip backend requires -DFLM_ENABLE_HIP_OGA=ON")
+            ("hip-oga-text-codec", po::value<std::string>(&parsed_args.hip_oga_text_codec),
+             "HIP text tokenizer and decoder: oga (default), flm, compare, external (legacy checked FLM)")
+            ("hip-oga-tokenizer", po::value<std::string>(&parsed_args.hip_oga_tokenizer),
+             "Override HIP text tokenizer: oga, flm, compare, external (legacy)")
+            ("hip-oga-decoder", po::value<std::string>(&parsed_args.hip_oga_decoder),
+             "Override HIP text decoder: oga, flm, compare, external (legacy)")
             ("prefill-chunk-len,pcl", po::value<int>(&parsed_args.prefill_chunk_len)->default_value(-1),
              "Set prefill chunk length")
             ("img-pre-resize,r", po::value<int>(&parsed_args.img_pre_resize)->default_value(2),
@@ -135,6 +142,16 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
                   .positional(pos_desc)
                   .run(), vm);
         po::notify(vm);
+
+        for (const char* option : {"hip-oga-text-codec", "hip-oga-tokenizer", "hip-oga-decoder"}) {
+            if (vm.count(option)) {
+                const auto value = vm[option].as<std::string>();
+                if (flm::hip_oga::normalize_selector_name(value).empty()) {
+                    throw std::invalid_argument(std::string("--") + option + " requires a nonempty mode");
+                }
+                (void)flm::hip_oga::parse_text_codec_selector(value);
+            }
+        }
 
         // Help has highest priority
         if (vm.count("help")) {

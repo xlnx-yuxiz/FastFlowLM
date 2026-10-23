@@ -38,8 +38,9 @@ discriminator capture, and regression fixtures.
 The continuation applies only that delta to GitHub demo base
 `2eb85e7bbea04552ea471668bceafe9b09c2c577`. It preserves the demo's instructions,
 provenance files, public-host checks, and existing prefix-cache integration.
-Runtime codec source matches the accepted implementation; this import does not
-add a new tokenizer algorithm or generation path. Existing build directories
+Recovery commit `3a738599` imported the accepted codec implementation. The
+continuation adds selectable `flm`/`compare` execution and lazy native codecs,
+without changing the tokenizer algorithm or OGA token generation. Existing build directories
 must rerun CMake to discover the added `hip_oga_external_tokenizer.cpp`.
 
 ## Delivered Selection And Ownership
@@ -47,19 +48,24 @@ must rerun CMake to discover the added `hip_oga_external_tokenizer.cpp`.
 | Mode | Prompt IDs | Output text | OGA codec calls |
 | --- | --- | --- | --- |
 | Default / `oga` | OGA | OGA | Required |
-| `external` tokenizer, compare unset | FastFlowLM after exact parity | Selected decoder | Required as oracle |
-| `external` decoder, compare unset | Selected tokenizer | FastFlowLM cumulative decode | Required as oracle |
-| Compare enabled | OGA | OGA | Required; FLM results compared |
+| `flm` | FLM | FLM cumulative decode | None for text |
+| `compare` | OGA | OGA | Both codecs; parity required |
+| Legacy `external` | FLM after exact parity | FLM after final equivalence | Required as oracle |
 
-Both provider variables accept `oga`, `native-oga`, `default`, or `external`.
-Chat templating is fixed to FastFlowLM/minja. There is no delivered template
-selector and no `flm`/`fflm` provider value.
+The normal CLI supports `--hip-oga-text-codec` plus independent
+`--hip-oga-tokenizer` and `--hip-oga-decoder` overrides for `run` and `serve`.
+See [configuration and precedence](../docs/instructions/hip-oga.md#text-codec-selection).
+Chat templating is fixed to FastFlowLM/minja. There is no template selector.
 
-Direct external mode is not a no-oracle mode. `OgaTokenizer` and
-`OgaTokenizerStream` are still constructed and called. Exact input-ID parity
-remains mandatory; generation aborts on a mismatch. Final plain-text decode may
-be `byte_exact` or `canonical_equivalent`; structured JSON/tool/code handling
-has stricter rules. Streaming chunk boundaries need not match.
+Native tokenizer/stream objects are created lazily for the layers that need
+them. Media forces OGA codecs and preserves the processor-backed decoder stream.
+Codec selection and file fingerprints no longer enter the KV compatibility
+signature: actual token prefixes, backend request state, capacity, and successful
+checkpoint restoration determine reuse.
+
+Historical receipts below were produced by the recovered implementation,
+including its mandatory runtime oracle checks. They do not verify the new
+`flm` path. New-source verification is recorded separately.
 
 The Gemma policy recognizes direct `Metaspace` and
 `Sequence -> Replace("▁", " ")` decoder contracts. It classifies the observed
@@ -144,6 +150,36 @@ Fresh local verification also passed the complete HIP OGA routing check
 tokenizer-probe test, the evidence schema validator, tokenizer parity self-test,
 and whitespace checks. A focused source review found no import regression.
 
+## New Codec-Mode Verification (2026-10-23)
+
+Built the normal Windows `flm` target from the continuation source using Visual
+Studio 18 2026, x64 Release, and `FLM_ENABLE_HIP_OGA=ON`. Configure and build both
+returned zero. The transferred source snapshot contained 1,938 files, verified
+by SHA-256 before building; the receipt records the changed runtime file hashes.
+
+| Fresh binary smoke check | Result |
+| --- | --- |
+| Qwen 2.5 Coder 14B: `oga`, `flm`, `compare` | All passed |
+| Gemma 3 4B text: `oga`, `flm`, `compare` | All passed |
+| Both `compare` runs | Exact prompt-ID parity and byte-exact decoder parity |
+| Both `flm` runs | Generated text without native OGA tokenizer creation or codec comparison |
+| Qwen `serve`, FLM codecs, two turns | Cached prompt tokens: 0 then 38; remembered the requested word |
+
+CLI runs used a 32-token upper bound and the packages' existing sampling
+settings. All six reported strict GPU execution with CPU EP fallback disabled.
+The harness deliberately enabled the legacy compare environment flag while
+passing explicit CLI modes, verifying that CLI selection overrides that flag.
+The FLM server also ran without native tokenizer creation. All owned model
+processes were cleaned up after the checks.
+
+Local checks passed for configuration precedence and legacy compatibility,
+cumulative decoding/canonical equivalence, tokenizer parity, routing, prefix
+policy, and checkpoint capacity. A focused review found no blocking issue.
+The [new-source receipt](../provenance/hip-oga-codec-modes-20261023.json)
+records this build and its smoke results separately from the historical receipts.
+This is bounded text verification; it does not establish performance, hot codec
+switching, long-lived server stability, or new VLM hardware coverage.
+
 ## Open Qualification Work
 
 - Direct-external 1024-token generation, a complete isolated-mode matrix, and
@@ -152,17 +188,16 @@ and whitespace checks. A focused source review found no import regression.
   outputs are not expected to have identical IDs without a deterministic setup.
 - Fresh-process one-token repetition does not establish memory stability in a
   long-lived server, multi-turn correctness, or codec-plus-prefix-cache behavior.
-- The shared cache key includes codec metadata/selector state, but this is not
-  an offline, content-addressed compatibility guarantee for arbitrary bundles.
-- Image selectors force OGA authority, but global compare mode still invokes
-  the external decoder and can fail the request. The inherited generation path
-  also resets the processor-created stream using the standalone tokenizer.
-  One passing Gemma VLM fixture does not qualify every processor-dependent VLM.
+- The new codec-independent cache boundary has policy and integration checks;
+  extended cross-mode multi-turn hardware qualification remains open.
+- The media stream and global-compare coupling have been corrected in this
+  continuation. One historical Gemma VLM fixture does not qualify every
+  processor-dependent VLM or establish coverage of the new binary.
 - Cumulative full-sequence decode prioritizes correctness and is not a measured
   tokenizer/streaming performance optimization.
-- No-oracle text operation needs a separate implementation and verification:
-  avoid constructing OGA codec objects, validate model-compatible bundles
-  offline, and test structured output, multi-turn operation, and cache identity.
+- FLM-only operation is implemented. Broader package qualification, offline
+  bundle compatibility checks, structured output and long-lived server tests
+  remain separate from bounded smoke verification.
 
 Keep external mode opt-in and scope support to tested packages until those
 gates are addressed. The existing OGA demo package and production/default

@@ -51,20 +51,24 @@ $env:ORT_DISABLE_CPU_EP_FALLBACK = '1'
 
 ## Experimental FastFlowLM Tokenizer And Decoder
 
-This continuation adds the reviewed external text-codec experiment. To use the
-model's FastFlowLM/tokenizers-cpp bundle for prompt encoding and generated text:
+Select both text codecs using the normal `run` or `serve` CLI:
 
 ```powershell
-$env:FLM_HIP_OGA_TOKENIZER_PROVIDER = 'external'
-$env:FLM_HIP_OGA_DECODER_PROVIDER = 'external'
-Remove-Item Env:FLM_HIP_OGA_TEXT_CODEC_COMPARE -ErrorAction SilentlyContinue
+flm run MODEL --backend hip --hip-oga-text-codec oga
+flm run MODEL --backend hip --hip-oga-text-codec flm
+flm run MODEL --backend hip --hip-oga-text-codec compare
 ```
 
-Unset the two providers or set them to `oga` to use the default OGA codec.
-Setting `FLM_HIP_OGA_TEXT_CODEC_COMPARE=1` instead keeps OGA in control and
-compares the FastFlowLM results. The template remains FastFlowLM/minja and OGA
-continues to generate every token in all modes. Direct external mode still uses
-OGA codec calls for parity checks; it is not a tokenizer-free OGA runtime.
+`oga` is the default. `flm` uses FastFlowLM/tokenizers-cpp without OGA text codec
+calls. `compare` executes both codecs, checks parity, and uses OGA output.
+Use `--hip-oga-tokenizer` or `--hip-oga-decoder` to override one layer, including
+for `serve`. The template remains FastFlowLM/minja and OGA generates every token.
+Image requests use the OGA processor and decoder.
+
+Environment alternatives and legacy `external` compatibility are documented in
+[codec configuration](docs/docs/instructions/hip-oga.md#text-codec-selection).
+Explicit per-layer CLI options override the combined CLI option, then environment
+settings. Legacy `external` still calls OGA codecs for parity checks.
 
 Reconfigure CMake before building an existing build directory so the new codec
 source is discovered. The [evaluation report](docs/architecture/hip-oga-token-boundary-evaluation.md)
@@ -81,8 +85,9 @@ $env:FLM_HIP_OGA_PREFIX_CACHE = 'experimental'
 
 The cache verifies token prefixes, restores a prior generator checkpoint, and
 appends only the uncached suffix. It invalidates on incompatible model,
-context, sampling, search, or capacity changes. VLM/image/audio requests force
-a cache miss.
+context, sampling, search, or capacity changes. VLM/image requests force
+a cache miss; audio is unsupported. Codec names, compare mode, and tokenizer fingerprints are not
+cache compatibility keys; reuse follows actual token prefixes and backend state.
 
 Qualified two-turn evidence observed 24 cached prompt tokens on the second
 experimental request, while the equivalent control request reported zero.

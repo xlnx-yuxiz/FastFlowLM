@@ -20,6 +20,9 @@ struct program_args_t {
     bool json_output = false;
     int ctx_length = -1; // let model decide
     std::string backend = ""; // empty/npu = FastFlowLM NPU path; hip = OGA over HIP EP
+    std::string hip_oga_text_codec;
+    std::string hip_oga_tokenizer;
+    std::string hip_oga_decoder;
     int prefill_chunk_len = -1; // let model decide
 
     // handling input file

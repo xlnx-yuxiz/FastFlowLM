@@ -105,9 +105,9 @@ adapter decodes the image payloads back to encoded image bytes, passes them to
 returned `OgaNamedTensors` with `OgaGenerator::SetInputs`, and decodes generated
 tokens through a processor-backed tokenizer stream.
 
-The existing text-only path is unchanged for prompts without media: FastFlowLM
-still applies the chat template, tokenizes with the native OGA tokenizer, and
-appends tokens to the generator directly.
+For prompts without media, FastFlowLM applies the chat template, tokenizes with
+the selected text codec (OGA by default), and appends tokens to the generator
+directly.
 
 Audio inputs fail fast in the HIP OGA backend until an audio-capable package is
 verified. Remote image URLs are also rejected; send inline base64 image data or
@@ -224,52 +224,56 @@ provider options through `OgaConfig::Overlay()` for every present OGA pipeline
 section (`decoder`, `embedding`, `vision`, and `speech`) before creating the
 model. It does not rely on `AppendProvider("AMDGPU")` for the HIP EP path.
 
-## External Text Codec Selectors
+## Text Codec Selection
 
-HIP OGA defaults to the OGA tokenizer and decoder; external selection is opt-in. The chat
-template frontend is fixed to FastFlowLM/minja because `HipOgaModel` owns
-`apply_chat_template()` through the FastFlowLM tokenizer config, not an OGA
-template callback. The tokenizer and decoder selectors are independent so an
-external provider can be compared or enabled one lane at a time:
+HIP OGA defaults to OGA encoding and decoding. The normal full CLI supports
+these process-wide options for both `run` and `serve`:
 
 ```shell
-export FLM_HIP_OGA_TOKENIZER_PROVIDER=oga
-export FLM_HIP_OGA_DECODER_PROVIDER=oga
-export FLM_HIP_OGA_TEXT_CODEC_COMPARE=1
+flm run MODEL --backend hip --hip-oga-text-codec oga
+flm run MODEL --backend hip --hip-oga-text-codec flm
+flm run MODEL --backend hip --hip-oga-text-codec compare
+flm serve MODEL --backend hip --hip-oga-text-codec flm --hip-oga-decoder compare
 ```
 
-Unset selector variables, `default`, `oga`, and `native-oga` all select the
-native OGA provider. `FLM_HIP_OGA_TEXT_CODEC_COMPARE=1` executes the
-FastFlowLM external tokenizer callback (`Tokenizer::encode`) against
-`HipOgaCausalLm::encode` and keeps OGA prompt IDs authoritative. Setting
-`FLM_HIP_OGA_TOKENIZER_PROVIDER=external` is a lab-only direct mode: it still
-compares both callbacks first, fails closed on any first mismatch, and feeds
-external IDs to OGA only after request-level parity passes.
+| Mode | Encoding / decoding | Output authority | Runtime parity check |
+| --- | --- | --- | --- |
+| `oga` (default) | OGA | OGA | None |
+| `flm` | FastFlowLM/tokenizers-cpp | FLM | None; skips OGA text codec calls |
+| `compare` | Both | OGA | Exact prompt IDs and accepted final decoder equivalence |
+| `external` (legacy) | Both | FLM | Same mandatory checks as the recovered experiment |
 
-To use FastFlowLM for both prompt IDs and output text, disable compare mode:
+`--hip-oga-tokenizer` and `--hip-oga-decoder` override the combined option for
+one layer. The chat template remains FastFlowLM/minja, and OGA generates all
+tokens in every mode. Full `flm` text mode does not instantiate `OgaTokenizer`
+or its stream; a mixed mode may need OGA for the selected layer. FLM uses the
+current model's tokenizer bundle, which must be compatible with its embeddings.
+Changing the codec does not convert token IDs between vocabularies.
 
-```powershell
-$env:FLM_HIP_OGA_TOKENIZER_PROVIDER = 'external'
-$env:FLM_HIP_OGA_DECODER_PROVIDER = 'external'
-Remove-Item Env:FLM_HIP_OGA_TEXT_CODEC_COMPARE -ErrorAction SilentlyContinue
+Configuration priority is per-layer CLI > combined CLI > environment > OGA.
+Environment-only configuration is also available:
+
+```shell
+export FLM_HIP_OGA_TEXT_CODEC=flm
+# Optional per-layer overrides:
+export FLM_HIP_OGA_TOKENIZER_PROVIDER=flm
+export FLM_HIP_OGA_DECODER_PROVIDER=compare
 ```
 
-`external` selects FastFlowLM/tokenizers-cpp using the current model's tokenizer
-bundle. `fflm` and `flm` are not accepted selector values. Compare mode takes
-precedence over the provider selectors: when it is enabled, OGA IDs and output
-remain authoritative even if a selector says `external`.
+Per-layer environment variables override `FLM_HIP_OGA_TEXT_CODEC`. Unset values,
+`default`, `oga`, and `native-oga` select OGA. Unknown values fail with an error.
+The legacy `FLM_HIP_OGA_TEXT_CODEC_COMPARE=1` overrides environment selectors
+with `compare` for both layers, preserving OGA authority. Explicit CLI options
+override this legacy flag for the selected layers. For example,
+`--hip-oga-tokenizer flm` with that flag set uses FLM encoding and decoder
+comparison. Options are resolved before server workers or models are created;
+there is no per-request codec switch. Effective selectors are logged on load.
 
-Direct external mode still creates and calls the OGA tokenizer/decoder as a
-runtime parity oracle. It does not remove the OGA tokenizer dependency. There
-is no independent chat-template provider selector.
-
-Decoder compare mode feeds only native OGA generated token IDs into
-`ExternalCumulativeDetokenizer`, whose callback is cumulative
-`Tokenizer::decode(vector<int>)`. OGA token selection and generation remain
-authoritative. Setting `FLM_HIP_OGA_DECODER_PROVIDER=external` is likewise a
-lab-only direct mode: it compares concatenated final text after the cumulative
-decoder finishes. Raw byte equality is recorded as a diagnostic class, not the
-only pass gate.
+The legacy `external` value retains checked FLM output for existing scripts;
+use `flm` for operation without OGA codec parity checks. In `compare` and
+`external`, prompt-ID mismatch aborts generation. Decoder comparison runs on
+the same OGA-generated IDs, using cumulative `Tokenizer::decode(vector<int>)`.
+Streaming chunk boundaries may differ; final text determines equivalence.
 
 Plain-text decoder parity uses four classes: `byte_exact`,
 `canonical_equivalent`, `structured_equivalent`, and `incompatible`.
@@ -279,18 +283,16 @@ identifies Gemma plus a metaspace decoder and the only visible difference is
 standalone `U+2581` rendered as a normal user-visible space. FastFlowLM records
 the raw OGA stream, OGA full decode, FastFlowLM full decode, external cumulative
 decode, token IDs, hashes, first mismatch, and normalization applied when
-`FLM_HIP_OGA_DECODER_DISCRIMINATOR_JSON` is set.
+`FLM_HIP_OGA_DECODER_DISCRIMINATOR_JSON` is set and decoder comparison is active.
+This diagnostic variable does not enable comparison in `flm` mode.
 
 Structured JSON/tool/code-like outputs stay strict. Parsed JSON may classify as
 `structured_equivalent` for formatting-only differences, but string values are
 not text-normalized; tool-call markup and code blocks must be byte-exact or
-they are incompatible. Image and other media turns force the tokenizer and
-decoder providers back to OGA because the OGA multimodal processor owns media
-tokenization. With compare mode enabled, the external decoder comparison still
-runs for media even though OGA supplies the output, and a comparison failure can
-abort the request. This experimental path has only bounded, model-specific VLM
-coverage. See the [token-boundary evaluation](../../architecture/hip-oga-token-boundary-evaluation.md)
-for the recovered evidence and remaining limitations.
+they are incompatible. Image turns force both layers to OGA, log the override,
+and use the multimodal processor's decoder stream without FLM comparison.
+Audio inputs remain unsupported. VLM coverage is bounded and model-specific;
+see the [token-boundary evaluation](../../architecture/hip-oga-token-boundary-evaluation.md).
 
 ## Experimental Text Prefix Cache
 
@@ -309,8 +311,16 @@ adapter then rewinds the OGA generator, appends only the uncached suffix, record
 `prompt_tokens_details.cached_tokens`, and logs attempted/hit/fallback counts
 with cached and newly-prefilled token totals.
 
-Any image or audio request resets the text checkpoint and takes the normal
-full-prefill OGA path. Cache miss, divergent tokens, model/context/signature
+Codec names, comparison mode, and tokenizer file fingerprints are diagnostics,
+not KV-cache compatibility keys. The cache manager checks actual token IDs and
+backend execution state independently. Under the same loaded model/context,
+identical token prefixes remain eligible regardless of which codec produced
+them; divergent token prefixes miss automatically. A decoder-only change cannot
+invalidate KV. Generator capacity and successful OGA checkpoint restoration
+remain required.
+
+Image requests reset the text checkpoint and take the normal full-prefill OGA
+path. Audio requests are rejected. Cache miss, divergent tokens, model/context/signature
 changes, insufficient generator capacity, cancellation, or provider exceptions
 also rebuild a fresh generator. Rewind/append/provider exceptions disable reuse
 for the current loaded model session and retry the full prompt once.

@@ -518,16 +518,30 @@ require("template_provider_selector_" not in adapter and
 for selector_member in ("tokenizer_provider_selector_", "decoder_provider_selector_"):
     require(selector_member in adapter,
             f"HIP adapter must keep an independent provider selector: {selector_member}")
-for env_name in ("FLM_HIP_OGA_TOKENIZER_PROVIDER", "FLM_HIP_OGA_DECODER_PROVIDER"):
-    require(
-        f'parse_text_codec_selector(flm::hip_oga::getenv_string("{env_name}"))' in adapter,
-        f"HIP adapter must parse default-off provider env var: {env_name}")
-require("FLM_HIP_OGA_TEXT_CODEC_COMPARE" in adapter and
-        "text_codec_compare_enabled_" in adapter,
-        "HIP adapter must expose an opt-in text-codec compare mode")
+codec_options = (ROOT / "src/include/AutoModel/hip_oga_codec_options.hpp").read_text()
+for env_name in ("FLM_HIP_OGA_TEXT_CODEC", "FLM_HIP_OGA_TOKENIZER_PROVIDER",
+                 "FLM_HIP_OGA_DECODER_PROVIDER", "FLM_HIP_OGA_TEXT_CODEC_COMPARE"):
+    require(env_name in codec_options, f"codec configuration must support {env_name}")
+require("text_codec_config_from_environment()" in adapter and
+        "apply_text_codec_cli_options" in main_cpp,
+        "CLI and adapter must share the codec configuration resolver")
 require('"frontend=fastflowlm-minja"' in adapter and
         "provider_signature(tokenizer_provider_selector_, decoder_provider_selector_" in adapter,
-        "HIP prefix-cache signatures must include the fixed frontend plus tokenizer/decoder provider identity")
+        "codec identity must remain available for diagnostics")
+cache_signature = re.search(
+    r"const std::string signature =\s*hip_engine->prefix_cache_signature\((.*?)\);", adapter, re.S)
+require(cache_signature is not None and
+        cache_signature.group(1).strip() == "prefix_cache_request_signature_",
+        "KV compatibility must use backend request state, not codec names or fingerprint")
+require("OgaTokenizer::Create(*model_)" not in adapter.split("class HipOgaCausalLm", 1)[1].split(
+        "void set_requested_max_tokens", 1)[0],
+        "FLM-only mode must not eagerly construct OGA tokenizer")
+require("decoder_execution.use_oga && this->is_normal_token" in adapter and
+        "if (decoder_execution.compare)" in adapter,
+        "native decoding and oracle comparison must be gated independently")
+require("multimodal_turn_ = true" in adapter and
+        "OgaTokenizerStream::Create(*processor_)" in adapter,
+        "media decoding must preserve processor stream selection")
 require("force_oga_text_providers_for_media" in adapter and
         "media request forces HIP OGA text providers" in adapter,
         "HIP adapter must force media requests through OGA text providers")
@@ -607,7 +621,7 @@ require("auto_chat_engine->generate(meta_info, length_limit, ostream" in chat_st
 adapter_lower = adapter.lower()
 for token in ("open_npu_device", "flm_rt::device(", "xrt::", "amdxdna", ".xclbin", "xclbin_manager("):
     require(token not in adapter_lower, f"HIP adapter should not reference NPU runtime token: {token}")
-for token in ("TextCodecProvider", "parse_text_codec_selector",
+for token in ("TextCodecProvider", "text_codec_execution",
               "default_text_codec_selector"):
     require(token in adapter,
             f"HIP adapter must wire external text-codec selector path: {token}")
@@ -699,6 +713,8 @@ require("ExternalTokenizerProbe" in encode_prompt_helper_body and
 require("describe_token_mismatch(tokenizer_parity)" in encode_prompt_helper_body and
         "external tokenizer parity mismatch" in encode_prompt_helper_body,
         "HIP adapter tokenizer helper must fail closed with first mismatch details")
+require("return fastflowlm_tokenizer.encode(templated_text);" in encode_prompt_helper_body,
+        "FLM tokenizer mode must bypass the OGA oracle")
 require("return parity.external_token_ids;" in encode_prompt_helper_body,
         "HIP adapter direct external tokenizer mode must use external ids only after parity passes")
 require("hip_engine->begin_turn(tokens)" in adapter,
@@ -872,6 +888,13 @@ with tempfile.TemporaryDirectory(prefix="flm-hip-oga-text-codec-") as tmpdir:
         sys.stderr.write(text_codec_result.stdout)
         sys.stderr.write(text_codec_result.stderr)
         raise SystemExit(text_codec_result.returncode)
+
+with tempfile.TemporaryDirectory(prefix="flm-hip-oga-codec-options-") as tmpdir:
+    binary = Path(tmpdir) / ("codec_options.exe" if os.name == "nt" else "codec_options")
+    subprocess.run([os.environ.get("CXX", "g++"), "-std=c++20", "-I", str(ROOT / "src/include"),
+                    str(ROOT / "src/test/hip_oga_backend_static/test_hip_oga_codec_options.cpp"),
+                    "-o", str(binary)], cwd=ROOT, check=True)
+    subprocess.run([str(binary)], cwd=ROOT, check=True)
 
 with tempfile.TemporaryDirectory(prefix="flm-hip-oga-tool-parser-") as tmpdir:
     parser_test = Path(tmpdir) / ("hip_oga_tool_parser_test.exe" if os.name == "nt" else "hip_oga_tool_parser_test")

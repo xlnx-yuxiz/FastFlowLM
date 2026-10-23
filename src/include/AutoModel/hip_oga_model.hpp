@@ -5,6 +5,7 @@
 #include "AutoModel/automodel.hpp"
 #include "AutoModel/hip_oga_prefix_cache.hpp"
 #include "AutoModel/hip_oga_text_codec.hpp"
+#include "AutoModel/hip_oga_codec_options.hpp"
 
 class HipOgaModel : public AutoModel {
 public:
@@ -45,5 +46,4 @@ private:
     flm::hip_oga::TextCodecSelector active_decoder_provider_selector_;
     flm::hip_oga::DecoderCanonicalizationPolicy decoder_canonicalization_policy_;
     std::string tokenizer_fingerprint_ = "{}";
-    bool text_codec_compare_enabled_ = false;
 };

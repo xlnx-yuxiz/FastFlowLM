@@ -10,7 +10,7 @@
   "independentRunsUsePackageSampling": true,
   "lockRemoved": true,
   "remainingFlmProcessCount": 0,
-  "scope": "Fresh execution of retained a2155f6c Windows binary; codec source restored unchanged to GitHub demo base 2eb85e7b. Independent sampled runs are not cross-run token-ID equality tests.",
+  "scope": "Fresh execution of retained a2155f6c Windows binary; historical recovery evidence for commit 3a738599 on demo base 2eb85e7b. Does not qualify subsequent FLM-only/config/cache changes. Independent sampled runs are not cross-run token-ID equality tests.",
   "records": [
     {
       "model": "hip-qwen25-coder-strict:14b",

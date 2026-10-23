@@ -17,6 +17,9 @@ namespace flm::hip_oga {
 
 enum class TextCodecProvider {
     Oga,
+    Flm,
+    Compare,
+    // Legacy FLM output with mandatory OGA parity checks.
     External,
 };
 
@@ -137,6 +140,10 @@ inline std::string to_string(TextCodecProvider provider) {
     switch (provider) {
         case TextCodecProvider::Oga:
             return "oga";
+        case TextCodecProvider::Flm:
+            return "flm";
+        case TextCodecProvider::Compare:
+            return "compare";
         case TextCodecProvider::External:
             return "external";
     }
@@ -215,17 +222,35 @@ inline TextCodecSelector parse_text_codec_selector(const std::string& selector) 
             "oga",
             !normalized.empty() && normalized != "default"};
     }
-    if (normalized == "external") {
+    if (normalized == "external" || normalized == "flm" || normalized == "compare") {
         return TextCodecSelector{
-            TextCodecProvider::External,
+            normalized == "flm" ? TextCodecProvider::Flm :
+                normalized == "compare" ? TextCodecProvider::Compare : TextCodecProvider::External,
             selector,
-            "external",
+            normalized,
             true};
     }
 
     throw std::invalid_argument(
         "Unknown HIP OGA text codec selector '" + selector +
-        "'. Supported text codec selectors: oga, external");
+        "'. Supported text codec selectors: oga, flm, compare, external (legacy checked FLM)");
+}
+
+struct TextCodecExecution {
+    bool use_oga;
+    bool use_flm;
+    bool compare;
+    bool output_flm;
+};
+
+inline TextCodecExecution text_codec_execution(const TextCodecSelector& selector) {
+    switch (selector.provider) {
+        case TextCodecProvider::Oga: return {true, false, false, false};
+        case TextCodecProvider::Flm: return {false, true, false, true};
+        case TextCodecProvider::Compare: return {true, true, true, false};
+        case TextCodecProvider::External: return {true, true, true, true};
+    }
+    throw std::invalid_argument("unknown HIP OGA text codec provider");
 }
 
 inline std::string join_token_ids_for_evidence(const std::vector<int>& token_ids) {

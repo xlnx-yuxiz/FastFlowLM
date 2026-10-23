@@ -1,0 +1,141 @@
+{
+  "schemaVersion": 1,
+  "branch": "feature/hip-oga-external-codec-demo",
+  "demoBase": "2eb85e7bbea04552ea471668bceafe9b09c2c577",
+  "recoveryCommit": "3a73859902eb4a5cb91ee005dffc5029010b2f58",
+  "scope": "Fresh normal Windows CLI build and bounded smoke runs for codec selection, no-oracle FLM text operation, and one FLM-mode two-turn cache hit. Independent sampled outputs are not cross-run ID equality tests.",
+  "runtimeSourceSha256": {
+    "src/common/AutoModel/hip_oga_model.cpp": "4acca58e9f7dbbcfb20d03b82a988f2d3916844297c63866566e7584e86d4312",
+    "src/include/AutoModel/hip_oga_model.hpp": "e685002b551e7c31638234d141e2243a8106fec866dadbde5a3286d218b0ac97",
+    "src/include/AutoModel/hip_oga_text_codec.hpp": "2391dd8c114baf7eb493efe93bfd7fc531aaf39039216d86923910a6752e2309",
+    "src/include/AutoModel/hip_oga_codec_options.hpp": "b09e5f5c8b841df38007e5c3a6cc88c86dc6705feebce4a01155deffa18e83a3",
+    "src/include/program_args.hpp": "617dd0a2290c105eb456e70d02faa42d036bd196a31b81502974d16bef358e1d",
+    "src/include/utils/vm_args.hpp": "3fa711a039062c1cd13825f9fb6a0760868fa463d01f44319b9592083563bb58",
+    "src/src/main.cpp": "7a46e4184a4bd9da95ef0cbb3be6d12a5d9e7b1aba0ab36c7b7609d4be118b04"
+  },
+  "sourceSnapshotManifestSha256": "d2124d798c210501073ed0925fd1fb0d2d1f980a220577bf9582788533d01a55",
+  "build": {
+    "generator": "Visual Studio 18 2026",
+    "architecture": "x64",
+    "configuration": "Release",
+    "target": "flm",
+    "FLM_ENABLE_HIP_OGA": "ON",
+    "configureExit": 0,
+    "buildExit": 0,
+    "binarySha256": "b8cca1196314809241231919dfb347cae30fff0cce331709dd3a4c8bc867efcc",
+    "finishedUtc": "2026-10-23T01:54:36.2943903Z"
+  },
+  "localChecks": {
+    "routingAndCodecFixtures": "PASS",
+    "codecOptionsAndPrecedence": "PASS",
+    "prefixCachePolicy": "PASS",
+    "prefixCacheCapacity": "PASS",
+    "externalTokenizerProbe": "PASS",
+    "gitDiffCheck": "PASS"
+  },
+  "smoke": {
+    "status": "PASS",
+    "startedUtc": "2026-10-23T01:54:37.6671665Z",
+    "maxTokens": 32,
+    "records": [
+      {
+        "model": "hip-qwen25-coder-strict:14b",
+        "mode": "oga",
+        "arguments": "run hip-qwen25-coder-strict:14b --backend hip --ctx-len 2048 --hip-oga-text-codec oga --prompt \"Explain token boundaries in one short sentence.\" --max-tokens 32",
+        "exitCode": 0,
+        "durationSeconds": 10.1482587,
+        "nativeTokenizerCreated": true,
+        "tokenizerParity": false,
+        "decoderParity": false,
+        "strictGpu": true,
+        "fallbackDisabled": true,
+        "status": "PASS"
+      },
+      {
+        "model": "hip-qwen25-coder-strict:14b",
+        "mode": "flm",
+        "arguments": "run hip-qwen25-coder-strict:14b --backend hip --ctx-len 2048 --hip-oga-text-codec flm --prompt \"Explain token boundaries in one short sentence.\" --max-tokens 32",
+        "exitCode": 0,
+        "durationSeconds": 8.0132203,
+        "nativeTokenizerCreated": false,
+        "tokenizerParity": false,
+        "decoderParity": false,
+        "strictGpu": true,
+        "fallbackDisabled": true,
+        "status": "PASS"
+      },
+      {
+        "model": "hip-qwen25-coder-strict:14b",
+        "mode": "compare",
+        "arguments": "run hip-qwen25-coder-strict:14b --backend hip --ctx-len 2048 --hip-oga-text-codec compare --prompt \"Explain token boundaries in one short sentence.\" --max-tokens 32",
+        "exitCode": 0,
+        "durationSeconds": 8.028486,
+        "nativeTokenizerCreated": true,
+        "tokenizerParity": true,
+        "decoderParity": true,
+        "strictGpu": true,
+        "fallbackDisabled": true,
+        "status": "PASS",
+        "decoderEquivalence": "byte_exact",
+        "generatedTokenCount": 19
+      },
+      {
+        "model": "hip-gemma3-text-strict:4b",
+        "mode": "oga",
+        "arguments": "run hip-gemma3-text-strict:4b --backend hip --ctx-len 2048 --hip-oga-text-codec oga --prompt \"Explain token boundaries in one short sentence.\" --max-tokens 32",
+        "exitCode": 0,
+        "durationSeconds": 12.9932056,
+        "nativeTokenizerCreated": true,
+        "tokenizerParity": false,
+        "decoderParity": false,
+        "strictGpu": true,
+        "fallbackDisabled": true,
+        "status": "PASS"
+      },
+      {
+        "model": "hip-gemma3-text-strict:4b",
+        "mode": "flm",
+        "arguments": "run hip-gemma3-text-strict:4b --backend hip --ctx-len 2048 --hip-oga-text-codec flm --prompt \"Explain token boundaries in one short sentence.\" --max-tokens 32",
+        "exitCode": 0,
+        "durationSeconds": 7.381054499999999,
+        "nativeTokenizerCreated": false,
+        "tokenizerParity": false,
+        "decoderParity": false,
+        "strictGpu": true,
+        "fallbackDisabled": true,
+        "status": "PASS"
+      },
+      {
+        "model": "hip-gemma3-text-strict:4b",
+        "mode": "compare",
+        "arguments": "run hip-gemma3-text-strict:4b --backend hip --ctx-len 2048 --hip-oga-text-codec compare --prompt \"Explain token boundaries in one short sentence.\" --max-tokens 32",
+        "exitCode": 0,
+        "durationSeconds": 8.5545938,
+        "nativeTokenizerCreated": true,
+        "tokenizerParity": true,
+        "decoderParity": true,
+        "strictGpu": true,
+        "fallbackDisabled": true,
+        "status": "PASS",
+        "decoderEquivalence": "byte_exact",
+        "generatedTokenCount": 26
+      },
+      {
+        "mode": "flm",
+        "command": "serve",
+        "firstCachedTokens": 0,
+        "secondCachedTokens": 38,
+        "nativeTokenizerCreated": false,
+        "status": "PASS"
+      }
+    ],
+    "finishedUtc": "2026-10-23T01:55:43.6807187Z",
+    "remainingFlmProcessCount": 0
+  },
+  "limitations": [
+    "Bounded text runs on Qwen 2.5 Coder 14B and Gemma 3 4B packages.",
+    "No new VLM hardware qualification.",
+    "One sequential FLM-mode server cache hit; no hot codec switching or long-lived stress qualification.",
+    "No tokenizer performance claim."
+  ]
+}
