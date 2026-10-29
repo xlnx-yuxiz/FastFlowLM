@@ -134,7 +134,7 @@ public:
                        std::shared_ptr<HttpSession> session);
 
     // Request tracking methods
-    void register_active_request(const std::string& request_id, std::shared_ptr<CancellationToken> token);
+    bool register_active_request(const std::string& request_id, std::shared_ptr<CancellationToken> token);
     void unregister_active_request(const std::string& request_id);
     bool cancel_request(const std::string& request_id);
     
@@ -168,6 +168,9 @@ private:
     std::size_t max_body_size_bytes_ = 256ull * 1024 * 1024; // 256 MB default
     size_t max_npu_queue_ = 10;
     std::string default_backend_;
+
+    // Protect the shared text engine for the complete synchronous handler.
+    std::mutex engine_request_mutex_;
 
     // Request tracking
     mutable std::mutex active_requests_mutex_;

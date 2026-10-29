@@ -15,11 +15,20 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <set>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
 #include <unordered_set>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace flm::hip_oga {
 namespace {
@@ -27,6 +36,7 @@ namespace {
 constexpr const char* kDefaultEndpointEnv = "FLM_HIP_OGA_HF_ENDPOINT";
 constexpr const char* kDefaultEndpoint = "https://huggingface.co";
 constexpr int kMaxDownloadAttempts = 3;
+constexpr const char* kInstallReceipt = "fastflowlm_hip_oga_install.json";
 
 struct FileEntry {
     std::string path;
@@ -141,6 +151,19 @@ std::vector<std::string> split_validated_path_segments(
             value.substr(cursor, slash == std::string::npos ? slash : slash - cursor);
         if (segment.empty() || segment == "." || segment == "..") {
             throw std::runtime_error(field_name + " contains an unsafe path component");
+        }
+        if (segment.back() == '.' || segment.back() == ' ' ||
+            segment.find_first_of(":<>\"|*%") != std::string::npos ||
+            std::any_of(segment.begin(), segment.end(), [](unsigned char c) { return c < 32; })) {
+            throw std::runtime_error(field_name + " contains an unsafe filesystem name");
+        }
+        std::string device = segment.substr(0, segment.find('.'));
+        std::transform(device.begin(), device.end(), device.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        if (device == "CON" || device == "PRN" || device == "AUX" || device == "NUL" ||
+            (device.size() == 4 && (device.rfind("COM", 0) == 0 || device.rfind("LPT", 0) == 0) &&
+             device[3] >= '1' && device[3] <= '9')) {
+            throw std::runtime_error(field_name + " contains a reserved filesystem name");
         }
         segments.push_back(segment);
         if (slash == std::string::npos) break;
@@ -378,7 +401,20 @@ std::vector<FileEntry> parse_file_entries(const nlohmann::json& public_hf) {
                 entry.path);
         }
         reject_case_colliding_path(entry.path, casefolded_paths);
+        if (lowercase_ascii(entry.path) == kInstallReceipt ||
+            lowercase_ascii(entry.path).rfind(std::string(kInstallReceipt) + "/", 0) == 0) {
+            throw std::runtime_error("package files must not replace the install receipt");
+        }
         entries.push_back(std::move(entry));
+    }
+    for (const auto& entry : entries) {
+        auto parent = std::filesystem::path(entry.path).parent_path();
+        while (!parent.empty()) {
+            if (casefolded_paths.count(lowercase_ascii(parent.generic_string()))) {
+                throw std::runtime_error("package manifest has a file/directory collision");
+            }
+            parent = parent.parent_path();
+        }
     }
     return entries;
 }
@@ -548,7 +584,7 @@ void download_with_sha256_retry(const std::string& url,
                     std::to_string(actual_size));
             }
             const std::string actual_sha256 = sha256_file(path);
-            if (actual_sha256 == entry.sha256) {
+            if (actual_sha256 == lowercase_ascii(entry.sha256)) {
                 return;
             }
             std::filesystem::remove(path);
@@ -628,7 +664,13 @@ void reject_symlinked_existing_components(
         if (status.type() == std::filesystem::file_type::not_found) {
             continue;
         }
-        if (std::filesystem::is_symlink(status)) {
+        bool linked = std::filesystem::is_symlink(status);
+#ifdef _WIN32
+        const DWORD attributes = GetFileAttributesW(current.c_str());
+        linked = linked || (attributes != INVALID_FILE_ATTRIBUTES &&
+                            (attributes & FILE_ATTRIBUTE_REPARSE_POINT));
+#endif
+        if (linked) {
             throw std::runtime_error(
                 "Backend 'hip' pull refuses symlinked path component for tag '" +
                 tag + "' under FLM_HIP_OGA_MODEL_ROOT");
@@ -638,7 +680,7 @@ void reject_symlinked_existing_components(
 
 std::filesystem::path ensure_install_path_under_root(
     const nlohmann::json& options,
-    const std::string& tag) {
+    const std::string& tag, bool create_root = true) {
     const auto configured_path = options.find("config_path");
     if (configured_path == options.end() || !configured_path->is_string()) {
         throw std::runtime_error(
@@ -655,10 +697,10 @@ std::filesystem::path ensure_install_path_under_root(
     }
     const std::filesystem::path root_input =
         std::filesystem::absolute(std::filesystem::path(root)).lexically_normal();
-    std::filesystem::create_directories(root_input);
+    if (create_root) std::filesystem::create_directories(root_input);
     const std::filesystem::path root_path =
         weakly_canonical_or_throw(root_input, "FLM_HIP_OGA_MODEL_ROOT");
-    if (!std::filesystem::is_directory(root_path)) {
+    if (std::filesystem::exists(root_path) && !std::filesystem::is_directory(root_path)) {
         throw std::runtime_error(
             "FLM_HIP_OGA_MODEL_ROOT must resolve to a directory");
     }
@@ -762,18 +804,153 @@ void write_install_metadata(const std::filesystem::path& temp_path,
         });
     }
     const std::filesystem::path metadata_path =
-        temp_path / "fastflowlm_hip_oga_install.json";
+        temp_path / kInstallReceipt;
     std::ofstream output(metadata_path, std::ios::out | std::ios::binary | std::ios::trunc);
     if (!output.is_open()) {
         throw std::runtime_error("failed to write " + metadata_path.string());
     }
     output << metadata.dump(2) << "\n";
+    output.close();
+    if (!output) throw std::runtime_error("failed to flush HIP OGA install receipt");
+}
+
+std::vector<FileEntry> validated_manifest(const nlohmann::json& public_hf,
+                                          const nlohmann::json& options) {
+    reject_credential_fields_recursive(public_hf, "");
+    validate_repo_id(read_required_string(public_hf, "repo_id", "hip_oga.public_hf"));
+    validate_revision(read_required_string(public_hf, "revision", "hip_oga.public_hf"));
+    read_source_subdir(public_hf);
+    auto files = parse_file_entries(public_hf);
+    ensure_file_entries_cover_required_files(files, options);
+    return files;
+}
+
+void verify_payload(const std::filesystem::path& root, const std::vector<FileEntry>& files) {
+    for (const auto& file : files) {
+        reject_symlinked_existing_components(root, file.path, "payload");
+        const auto path = root / file.path;
+        if (!std::filesystem::is_regular_file(path) || std::filesystem::file_size(path) != file.size ||
+            sha256_file(path) != lowercase_ascii(file.sha256)) {
+            throw std::runtime_error("HIP OGA size/sha256 mismatch or missing file: " + file.path);
+        }
+    }
+}
+
+// Audit the entire tree before mutation. Unlisted files/directories belong to
+// the caller; even --force must preserve them. Never traverse links/junctions.
+std::vector<std::filesystem::path> audit_owned_tree(
+    const std::filesystem::path& root, const std::vector<FileEntry>& files) {
+    std::set<std::string> allowed_files{kInstallReceipt}, allowed_dirs;
+    for (const auto& file : files) {
+        allowed_files.insert(file.path);
+        auto parent = std::filesystem::path(file.path).parent_path();
+        while (!parent.empty()) {
+            allowed_dirs.insert(parent.generic_string());
+            parent = parent.parent_path();
+        }
+    }
+    std::vector<std::filesystem::path> directories;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+        const auto relative = entry.path().lexically_relative(root);
+        reject_symlinked_existing_components(root, relative, "managed package");
+        if (entry.is_directory()) {
+            if (!allowed_dirs.count(relative.generic_string())) {
+                throw std::runtime_error("HIP OGA package contains an untracked directory: " + relative.generic_string());
+            }
+            directories.push_back(relative);
+        } else if (!entry.is_regular_file() || !allowed_files.count(relative.generic_string())) {
+            throw std::runtime_error("HIP OGA package contains an untracked file: " + relative.generic_string());
+        }
+    }
+    std::sort(directories.begin(), directories.end(), [](const auto& a, const auto& b) {
+        return std::distance(a.begin(), a.end()) > std::distance(b.begin(), b.end());
+    });
+    return directories;
+}
+
+void require_matching_receipt(const std::filesystem::path& root, const nlohmann::json& public_hf) {
+    reject_symlinked_existing_components(root, kInstallReceipt, "install receipt");
+    const auto path = root / kInstallReceipt;
+    if (!std::filesystem::is_regular_file(path) || std::filesystem::file_size(path) > 4 * 1024 * 1024) {
+        throw std::runtime_error("HIP OGA remove requires a managed install receipt");
+    }
+    std::ifstream input(path);
+    const auto receipt = nlohmann::json::parse(input);
+    if (!receipt.is_object() || receipt.value("schema_version", "") != "fastflowlm-hip-oga-public-hf/v1" ||
+        receipt.value("repo_id", "") != public_hf.at("repo_id") ||
+        receipt.value("revision", "") != public_hf.at("revision") ||
+        receipt.value("source_subdir", "") != public_hf.value("source_subdir", "") ||
+        !receipt.contains("files") || receipt["files"] != public_hf.at("files")) {
+        throw std::runtime_error("HIP OGA install receipt does not match the pinned catalog manifest");
+    }
+}
+
+void require_download_space(const std::filesystem::path& path, const std::vector<FileEntry>& files) {
+    std::uint64_t required = 64 * 1024 * 1024; // receipt + filesystem margin
+    for (const auto& file : files) {
+        if (file.size > std::numeric_limits<std::uint64_t>::max() - required) {
+            throw std::runtime_error("HIP OGA package size overflow");
+        }
+        required += file.size;
+    }
+    auto parent = path.parent_path();
+    while (!std::filesystem::exists(parent)) parent = parent.parent_path();
+    if (std::filesystem::space(parent).available < required) {
+        throw std::runtime_error("Insufficient free disk space for HIP OGA staged download: need " +
+                                 std::to_string(required) + " bytes");
+    }
 }
 
 }  // namespace
 
 PublicHfDownloader::PublicHfDownloader(model_list& models)
     : supported_models_(models) {}
+
+bool PublicHfDownloader::check(const std::string& model_tag) {
+    try {
+        const auto path = supported_models_.get_hip_oga_model_path(model_tag);
+        const auto options = supported_models_.get_hip_oga_model_options(model_tag);
+        const auto public_hf = supported_models_.get_hip_oga_public_hf_config(model_tag);
+        verify_payload(path, validated_manifest(public_hf, options));
+        header_print("FLM", "HIP OGA pinned package integrity verified: " << path);
+        return true;
+    } catch (const std::exception& e) {
+        header_print("ERROR", "HIP OGA check failed: " + std::string(e.what()));
+        return false;
+    }
+}
+
+bool PublicHfDownloader::remove(const std::string& model_tag) {
+    try {
+        const auto options = supported_models_.get_hip_oga_model_options(model_tag);
+        const auto public_hf = supported_models_.get_hip_oga_public_hf_config(model_tag);
+        const auto files = validated_manifest(public_hf, options);
+        const auto path = ensure_install_path_under_root(options, model_tag, false);
+        if (!std::filesystem::exists(path)) {
+            header_print("FLM", "HIP OGA package already absent: " << path.string());
+            return true;
+        }
+        require_matching_receipt(path, public_hf);
+        const auto directories = audit_owned_tree(path, files);
+        // Delete named files only. A concurrently added untracked file prevents
+        // the final directory removal instead of being recursively erased.
+        for (const auto& file : files) {
+            reject_symlinked_existing_components(path, file.path, model_tag);
+            std::filesystem::remove(path / file.path);
+        }
+        for (const auto& directory : directories) {
+            reject_symlinked_existing_components(path, directory, model_tag);
+            std::filesystem::remove(path / directory);
+        }
+        std::filesystem::remove(path / kInstallReceipt);
+        std::filesystem::remove(path);
+        header_print("FLM", "Removed managed HIP OGA package: " << path.string());
+        return true;
+    } catch (const std::exception& e) {
+        header_print("ERROR", "HIP OGA remove failed: " + std::string(e.what()));
+        return false;
+    }
+}
 
 bool PublicHfDownloader::pull(const std::string& model_tag, bool force_redownload) {
     try {
@@ -794,9 +971,9 @@ bool PublicHfDownloader::pull(const std::string& model_tag, bool force_redownloa
                 public_hf, "revision", "hip_oga.public_hf"));
         const std::string model_kind =
             read_required_string(public_hf, "model_kind", "hip_oga.public_hf");
-        if (model_kind != "text") {
+        if (model_kind != "text" && model_kind != "vlm") {
             throw std::runtime_error(
-                "HIP OGA public pull only supports text models in this prototype");
+                "HIP OGA public pull expects model_kind text or vlm");
         }
         const std::string source_subdir = read_source_subdir(public_hf);
         const std::string endpoint = resolve_endpoint(public_hf);
@@ -809,6 +986,7 @@ bool PublicHfDownloader::pull(const std::string& model_tag, bool force_redownloa
             try {
                 supported_models_.validate_hip_oga_model_path_for_tag(
                     resolved_tag, install_path.string());
+                verify_payload(install_path, files);
                 header_print("FLM", "HIP OGA package already installed: " <<
                     install_path.string());
                 return true;
@@ -816,6 +994,12 @@ bool PublicHfDownloader::pull(const std::string& model_tag, bool force_redownloa
                 header_print("FLM", "Existing HIP OGA package is incomplete; reinstalling from public Hugging Face.");
             }
         }
+
+        if (std::filesystem::exists(install_path)) {
+            require_matching_receipt(install_path, public_hf);
+            audit_owned_tree(install_path, files);
+        }
+        require_download_space(install_path, files);
 
         const std::filesystem::path temp_path = make_temp_install_path(install_path);
         std::filesystem::remove_all(temp_path);

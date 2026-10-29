@@ -61,96 +61,108 @@ void Qwen3_5_Omni::setup_tokenizer(std::string model_path) {
     }
     this->user_system_prompt = "";
     this->extra_context["user_system_prompt"] = this->user_system_prompt;
+    this->_detect_chat_format(tokenizer_config["chat_template"].get<std::string>());
 }
 
-void Qwen3_5_Omni::load_model(std::string model_path, json model_info, int default_context_length, bool enable_preemption) {
+void Qwen3_5_Omni::load_model(std::string model_path, json model_info, int default_context_length, bool enable_preemption, const std::string& backend) {
+    const auto selected = flm::backend::normalize_backend(backend);
+    if (selected != flm::backend::kFlmBackendId) {
+        throw std::invalid_argument("Qwen3.5 Omni frontend requires backend flm");
+    }
+    const int resolved_context = default_context_length == -1
+        ? model_info.value("default_context_length", 4096) : default_context_length;
+    if (resolved_context < 1) throw std::out_of_range("Omni context length must be positive");
+    if (!npu_device_inst) throw std::invalid_argument("Omni requires an NPU device");
     if (this->is_model_loaded && this->model_path == model_path) {
         header_print("FLM", "Model already loaded: " << this->model_path);
         return;
     }
-    this->model_path = model_path;
-    header_print("FLM", "Loading model: " << this->model_path);
+    engine.reset();
+    _release_model_state();
+    try {
+        this->model_path = model_path;
+        header_print("FLM", "Loading model: " << this->model_path);
 
-    this->lm_config = std::make_unique<LM_Config>();
-    this->lm_config->from_pretrained(this->model_path);
+        this->lm_config = std::make_unique<LM_Config>();
+        this->lm_config->from_pretrained(this->model_path);
 
-    // The omni thinker vocab lives in thinker_config.text_config, so the
-    // top-level "vocab_size" is 0. Republish it at the top level so every
-    // downstream reader (set_sampler, set_topk, ...) sees the real vocab.
-    {
-        auto& jc = this->lm_config->_json_config;
-        if (jc.contains("thinker_config") && jc["thinker_config"].contains("text_config")) {
-            jc["vocab_size"] =
-                json_u32(jc["thinker_config"]["text_config"], "vocab_size", this->lm_config->get("vocab_size"));
+        // The omni thinker vocab lives in thinker_config.text_config, so the
+        // top-level "vocab_size" is 0. Republish it at the top level so every
+        // downstream reader (set_sampler, set_topk, ...) sees the real vocab.
+        {
+            auto& jc = this->lm_config->_json_config;
+            if (jc.contains("thinker_config") && jc["thinker_config"].contains("text_config")) {
+                jc["vocab_size"] =
+                    json_u32(jc["thinker_config"]["text_config"], "vocab_size", this->lm_config->get("vocab_size"));
+            }
         }
+
+        if (this->npu_device_inst == nullptr) {
+            header_print("ERROR", "NPU device instance is nullptr");
+            exit(1);
+        }
+        this->npu = std::make_unique<npu_xclbin_manager>(npu_device::device_npu2, this->npu_device_inst, enable_preemption);
+        this->enable_preemption = enable_preemption;
+
+        if (default_context_length != -1) {
+            this->MAX_L = default_context_length;
+        } else {
+            this->MAX_L = model_info.value("default_context_length", 4096);
+        }
+
+        // vision config (thinker_config.vision_config) with VL fallbacks
+        const auto& jc = this->lm_config->_json_config;
+        if (jc.contains("thinker_config") && jc["thinker_config"].contains("vision_config")) {
+            const auto& vc = jc["thinker_config"]["vision_config"];
+            const nlohmann::json &vision_config = this->lm_config->_json_config["vision_config"];
+
+            this->patch_size          = json_u32(vc, "patch_size", this->patch_size);
+            this->temporal_patch_size = json_u32(vc, "temporal_patch_size", this->temporal_patch_size);
+
+
+            this->merge_size          = json_u32(vision_config, "merge_size", this->merge_size);
+            this->shortest_edge       = json_u32(vision_config, "shortest_edge", this->shortest_edge);
+            this->longest_edge        = json_u32(vision_config, "longest_edge", this->longest_edge);
+            this->vision_rescale_factor = json_fp32(vision_config, "rescale_factor", this->vision_rescale_factor);
+            this->vision_image_mean = json_fp32(vision_config, "rescale_mean", this->vision_image_mean);
+            this->vision_image_std = json_fp32(vision_config, "rescale_std", this->vision_image_std);
+        }
+
+
+        this->engine = std::make_unique<qwen3_5_omni>(*this->lm_config, this->npu.get(), this->MAX_L);
+        {
+            Q4NX q4nx(this->model_path);
+            this->engine->load_weights(q4nx);
+        }
+        this->engine->clear_context();
+
+        this->tokenizer = std::make_unique<Tokenizer>(this->model_path);
+        this->setup_tokenizer(this->model_path);
+
+        // default greedy-ish sampler (overridable via set_* helpers)
+        sampler_config config;
+        config.top_k = 20;
+        config.top_p = 0.8;
+        config.min_p = 0.0;
+        config.temperature = 0.7;
+        config.rep_penalty = 1.0;
+        config.freq_penalty = 1.0;
+        config.pre_penalty = 1.5f;
+        this->set_sampler(config);
+
+        this->is_model_loaded = true;
+        this->last_token = -1;
+        this->total_tokens = 0;
+        this->token_history.clear();
+        this->token_history.reserve(this->MAX_L);
+        for (size_t i = 0; i < PROFILER_TYPE_NUM; i++) {
+            this->profiler_list[i].reset();
+        }
+    } catch (...) {
+        engine.reset();
+        _release_model_state();
+        throw;
     }
-
-    if (this->npu_device_inst == nullptr) {
-        header_print("ERROR", "NPU device instance is nullptr");
-        exit(1);
-    }
-    this->npu = std::make_unique<npu_xclbin_manager>(npu_device::device_npu2, this->npu_device_inst, enable_preemption);
-    this->enable_preemption = enable_preemption;
-
-    if (default_context_length != -1) {
-        this->MAX_L = default_context_length;
-    } else {
-        this->MAX_L = model_info.value("default_context_length", 4096);
-    }
-
-    // vision config (thinker_config.vision_config) with VL fallbacks
-    const auto& jc = this->lm_config->_json_config;
-    if (jc.contains("thinker_config") && jc["thinker_config"].contains("vision_config")) {
-        const auto& vc = jc["thinker_config"]["vision_config"];
-        const nlohmann::json &vision_config = this->lm_config->_json_config["vision_config"];
-
-        this->patch_size          = json_u32(vc, "patch_size", this->patch_size);
-        this->temporal_patch_size = json_u32(vc, "temporal_patch_size", this->temporal_patch_size);
-
-
-        this->merge_size          = json_u32(vision_config, "merge_size", this->merge_size);
-        this->shortest_edge       = json_u32(vision_config, "shortest_edge", this->shortest_edge);
-        this->longest_edge        = json_u32(vision_config, "longest_edge", this->longest_edge);
-        this->vision_rescale_factor = json_fp32(vision_config, "rescale_factor", this->vision_rescale_factor);
-        this->vision_image_mean = json_fp32(vision_config, "rescale_mean", this->vision_image_mean);
-        this->vision_image_std = json_fp32(vision_config, "rescale_std", this->vision_image_std);
-    }
-
-
-    this->engine = std::make_unique<qwen3_5_omni>(*this->lm_config, this->npu.get(), this->MAX_L);
-    {
-        Q4NX q4nx(this->model_path);
-        this->engine->load_weights(q4nx);
-    }
-    this->engine->clear_context();
-
-    this->tokenizer = std::make_unique<Tokenizer>(this->model_path);
-    this->setup_tokenizer(this->model_path);
-
-    // default greedy-ish sampler (overridable via set_* helpers)
-    sampler_config config;
-    config.top_k = 20;
-    config.top_p = 0.8;
-    config.min_p = 0.0;
-    config.temperature = 0.7;
-    config.rep_penalty = 1.0;
-    config.freq_penalty = 1.0;
-    config.pre_penalty = 1.5f;
-    this->set_sampler(config);
-
-    this->is_model_loaded = true;
-    this->last_token = -1;
-    this->total_tokens = 0;
-    this->token_history.clear();
-    this->token_history.reserve(this->MAX_L);
-    for (size_t i = 0; i < PROFILER_TYPE_NUM; i++) {
-        this->profiler_list[i].reset();
-    }
-
-
-
-
-
 }
 
 std::string Qwen3_5_Omni::apply_chat_template(nlohmann::ordered_json& messages, nlohmann::ordered_json tools) {
@@ -318,6 +330,7 @@ bool Qwen3_5_Omni::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input
     }
 
 
+    meta_info.prompt_tail = templated_text.substr(templated_text.size() > 4096 ? templated_text.size() - 4096 : 0);
     std::vector<int> tokens_init = this->tokenizer->encode(templated_text);
 
     // ---- expand soft-token placeholders ----
@@ -697,8 +710,7 @@ buffer<bf16> Qwen3_5_Omni::say(std::string wav_out_path) {
 }
 
 void Qwen3_5_Omni::set_sampler(sampler_config& sampler_config) {
-    if (this->sampler != nullptr) this->sampler.reset();
-    this->sampler = std::make_unique<Sampler>((int)this->lm_config->get("vocab_size"), sampler_config);
+    AutoModel::set_sampler(sampler_config);
 }
 
 void Qwen3_5_Omni::clear_context() {

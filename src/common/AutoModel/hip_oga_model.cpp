@@ -1,12 +1,18 @@
 /// \file hip_oga_model.cpp
 /// \brief Prototype AutoModel backed by ONNX Runtime GenAI over HIP EP
 #include "AutoModel/hip_oga_model.hpp"
+#include "AutoModel/hip_oga_backend.hpp"
 #include "AutoModel/hip_oga_external_tokenizer.hpp"
 #include "AutoModel/hip_oga_prefix_cache.hpp"
+#include "AutoModel/hip_oga_media_inputs.hpp"
 #include "AutoModel/hip_oga_text_codec.hpp"
 #include "AutoModel/hip_oga_tool_parser.hpp"
+#include "AutoModel/hip_oga_sampling.hpp"
+#include "AutoModel/hip_oga_errors.hpp"
+#include "AutoModel/hip_oga_constraint.hpp"
 #include "base64.hpp"
 #include "hip_oga_policy.hpp"
+#include "hip_oga_config_directory.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -294,7 +300,7 @@ json HipOgaModel::model_info_for_path(const std::string& model_path) {
         model_info["vocab_size"] =
             genai_config["model"]["vocab_size"].get<std::uint32_t>();
     }
-    model_info["details"] = json{{"family", "llama3"}};
+    model_info["details"] = json{{"family", flm::backend::kHipOgaGenericFamily}};
     model_info["hip_oga"] = json{
         {"config_path", model_path},
         {"offload_policy", flm::hip_oga::direct_model_offload_policy()},
@@ -393,18 +399,6 @@ void log_text_codec_parity(
         " external_tokens=" +
         flm::hip_oga::join_token_ids_for_evidence(parity.external_token_ids) +
         (parity.notes.empty() ? std::string() : " notes=" + parity.notes));
-}
-
-void force_oga_text_providers_for_media(
-    flm::hip_oga::TextCodecSelector& tokenizer_provider_selector,
-    flm::hip_oga::TextCodecSelector& decoder_provider_selector) {
-    if (tokenizer_provider_selector.provider == flm::hip_oga::TextCodecProvider::Oga &&
-        decoder_provider_selector.provider == flm::hip_oga::TextCodecProvider::Oga) {
-        return;
-    }
-    header_print("FLM", "media request forces HIP OGA text providers");
-    tokenizer_provider_selector = flm::hip_oga::default_text_codec_selector();
-    decoder_provider_selector = flm::hip_oga::default_text_codec_selector();
 }
 
 std::string get_hip_oga_string(const nlohmann::ordered_json& model_info,
@@ -712,27 +706,106 @@ HipOgaLoadedImages load_hip_oga_images(
         image_sizes.push_back(loaded.buffers.back().size());
     }
 
-    loaded.images = OgaImages::Load(image_data.data(), image_sizes.data(), image_sizes.size());
+    loaded.images = flm::hip_oga::with_image_input_errors([&] {
+        return OgaImages::Load(image_data.data(), image_sizes.data(), image_sizes.size());
+    });
     return loaded;
 }
 
-std::size_t read_oga_prompt_token_count(OgaNamedTensors& inputs) {
-    auto input_ids = inputs.Get("input_ids");
-    const auto shape = input_ids->Shape();
-    if (shape.empty()) {
-        throw std::runtime_error(
-            "HIP OGA multimodal processor produced scalar input_ids");
+std::vector<int> read_oga_token_tensor(OgaNamedTensors& inputs, const char* name) {
+    auto tensor = inputs.Get(name);
+    const auto shape = tensor->Shape();
+    if (shape.size() != 2 || shape[0] != 1 || shape[1] <= 0 ||
+        shape[1] > std::numeric_limits<int>::max()) {
+        throw std::runtime_error(std::string("Invalid HIP OGA token tensor shape: ") + name);
     }
-    if (shape.size() > 1 && shape.front() != 1) {
-        throw std::runtime_error(
-            "HIP OGA backend multimodal path supports batch size 1 only");
+    const auto type = tensor->Type();
+    if (type != OgaElementType_int32 && type != OgaElementType_int64) {
+        throw std::runtime_error(std::string("Invalid HIP OGA token tensor type: ") + name);
     }
-    if (shape.back() <= 0) {
-        throw std::runtime_error(
-            "HIP OGA multimodal processor produced empty input_ids");
+    const void* data = tensor->Data();
+    if (!data) throw std::runtime_error("HIP OGA token tensor has no data");
+    std::vector<int> tokens;
+    tokens.reserve(static_cast<std::size_t>(shape[1]));
+    for (std::int64_t i = 0; i < shape[1]; ++i) {
+        const std::int64_t value = type == OgaElementType_int32
+            ? static_cast<const std::int32_t*>(data)[i]
+            : static_cast<const std::int64_t*>(data)[i];
+        // Some OGA processors (for example Phi vision) use negative image
+        // placeholders. Preserve signed input IDs even when reuse is disabled.
+        if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max() ||
+            (std::string_view(name) != "input_ids" && value < 0)) {
+            throw std::runtime_error("HIP OGA token tensor value is out of range");
+        }
+        tokens.push_back(static_cast<int>(value));
     }
-    return static_cast<std::size_t>(shape.back());
+    return tokens;
 }
+
+flm::hip_oga::MediaTensorIdentity copy_oga_media_tensor(
+    OgaNamedTensors& inputs, const char* name) {
+    auto tensor = inputs.Get(name);
+    flm::hip_oga::MediaTensorIdentity identity;
+    identity.name = name;
+    identity.element_type = static_cast<int>(tensor->Type());
+    identity.shape = tensor->Shape();
+    std::size_t bytes = 0;
+    switch (tensor->Type()) {
+        case OgaElementType_float32: bytes = 4; break;
+        case OgaElementType_float16:
+        case OgaElementType_bfloat16: bytes = 2; break;
+        case OgaElementType_int64: bytes = 8; break;
+        default: throw std::runtime_error("Unsupported HIP OGA media tensor type");
+    }
+    for (const auto dim : identity.shape) {
+        if (dim <= 0 || static_cast<std::uint64_t>(dim) >
+                           std::numeric_limits<std::size_t>::max() / bytes) {
+            throw std::runtime_error("Invalid HIP OGA media tensor shape");
+        }
+        bytes *= static_cast<std::size_t>(dim);
+    }
+    const auto* data = static_cast<const std::uint8_t*>(tensor->Data());
+    if (!data) throw std::runtime_error("HIP OGA media tensor has no data");
+    identity.bytes.assign(data, data + bytes);
+    return identity;
+}
+
+struct HipOgaPreparedMedia {
+    // Keep the exact loaded image snapshot alive through SetInputs and recovery.
+    HipOgaLoadedImages loaded_images;
+    std::unique_ptr<OgaNamedTensors> inputs;
+    std::vector<int> tokens;
+    std::optional<flm::hip_oga::MediaCacheIdentity> identity;
+    nlohmann::json input_contract;
+};
+
+struct HipOgaEmptyImageInputs {
+    // Own backing storage for the lifetime of the generator. A zero-token
+    // image feature tensor still needs a batch dimension for rank-3 Gemma.
+    std::vector<std::int32_t> token_ids;
+    std::vector<std::int64_t> token_types;
+    std::int64_t image_tokens = 0;
+    std::uint16_t empty_pixels = 0;
+    std::unique_ptr<OgaTensor> ids_tensor, types_tensor, count_tensor, pixels_tensor;
+    std::unique_ptr<OgaNamedTensors> inputs;
+
+    explicit HipOgaEmptyImageInputs(const std::vector<std::int32_t>& ids)
+        : token_ids(ids), token_types(ids.size(), 0) {
+        const std::int64_t token_shape[]{1, static_cast<std::int64_t>(ids.size())};
+        const std::int64_t count_shape[]{1};
+        const std::int64_t pixel_shape[]{1, 3, 0, 0};
+        // The pinned OGA SetInputs interface consumes input_ids as int32.
+        ids_tensor = OgaTensor::Create(token_ids.data(), token_shape, 2, OgaElementType_int32);
+        types_tensor = OgaTensor::Create(token_types.data(), token_shape, 2, OgaElementType_int64);
+        count_tensor = OgaTensor::Create(&image_tokens, count_shape, 1, OgaElementType_int64);
+        pixels_tensor = OgaTensor::Create(&empty_pixels, pixel_shape, 4, OgaElementType_float16);
+        inputs = OgaNamedTensors::Create();
+        inputs->Set("input_ids", *ids_tensor);
+        inputs->Set("token_type_ids", *types_tensor);
+        inputs->Set("num_image_tokens", *count_tensor);
+        inputs->Set("pixel_values", *pixels_tensor);
+    }
+};
 
 class HipOgaCausalLm final : public causal_lm {
 public:
@@ -748,7 +821,6 @@ public:
               nlohmann::json::parse(model_info_.dump()))) {
         ensure_oga_process_handle();
         const auto config_path = resolve_oga_config_path(model_path_, model_info_);
-        config_ = OgaConfig::Create(config_path.string().c_str());
         const auto genai_config =
             read_json_file_if_present(config_path / "genai_config.json");
         nlohmann::json hip_oga_options = nlohmann::json::object();
@@ -764,16 +836,71 @@ public:
             flm::hip_oga::getenv_flag_enabled("FLM_HIP_OGA_DIAGNOSTICS");
         const std::string diagnostics_prefix =
             flm::hip_oga::getenv_string("FLM_HIP_OGA_PROFILE_PREFIX");
-        const auto overlay =
-            flm::hip_oga::build_session_overlay(genai_config,
+        const auto effective_config =
+            flm::hip_oga::build_effective_config(genai_config,
                                                 hip_oga_options,
                                                 diagnostics_enabled,
                                                 diagnostics_prefix);
-        // strict_gpu maps to OGA session.disable_cpu_ep_fallback="1" via
-        // OGA's per-section disable_cpu_ep_fallback session option.
-        config_->Overlay(overlay.dump().c_str());
-
+        append_token_ids(model_eos_ids_, effective_config.at("model").at("eos_token_id"));
+        gemma3_model_ = effective_config.at("model").value("type", "") == "gemma3";
+        image_token_id_ = gemma3_model_ ? effective_config.at("model").value("image_token_id", -1) : -1;
+        media_rewind_qualified_ = gemma3_model_ &&
+            effective_config.value("search", nlohmann::json::object())
+                .value("past_present_share_buffer", false);
+        const auto media_compatibility = flm::hip_oga::read_media_compatibility(config_path / "flm_hip_oga.json");
+        flat_gemma3_features_ = flm::hip_oga::uses_flat_gemma3_features(
+            media_compatibility, effective_config);
+        media_processor_signature_ = effective_config.dump() + ";processor=" +
+            read_json_file_if_present(config_path / "processor_config.json").dump() +
+            ";image_features=" + media_compatibility.dump();
+        config_directory_ = std::make_unique<flm::hip_oga::ScopedConfigDirectory>(
+            config_path, effective_config);
+        config_ = OgaConfig::Create(config_directory_->path().string().c_str());
         model_ = OgaModel::Create(*config_);
+        const auto defaults = OgaGeneratorParams::Create(*model_);
+        sampling_ = std::make_unique<flm::hip_oga::SamplingState>(
+            flm::hip_oga::read_oga_sampling_options(*defaults),
+            genai_config.at("model").at("vocab_size").get<int>());
+    }
+
+    void configure_sampling(const nlohmann::json& options, bool request_reset) {
+        auto candidate = *sampling_;
+        if (request_reset) candidate.reset_request(options);
+        else candidate.update(options);
+        auto params = OgaGeneratorParams::Create(*model_);
+        flm::hip_oga::apply_oga_sampling_options(*params, candidate.effective(), candidate.provider());
+        *sampling_ = std::move(candidate);
+    }
+
+    void set_sampling_provider(const std::string& name) {
+        auto candidate = *sampling_;
+        candidate.set_default_provider(name);
+        auto params = OgaGeneratorParams::Create(*model_);
+        flm::hip_oga::apply_oga_sampling_options(*params, candidate.effective(), candidate.provider());
+        *sampling_ = std::move(candidate);
+    }
+
+    void begin_sampling_turn() {
+        if (sampling_->provider() == flm::sampling::Provider::Common)
+            common_sampler_.reset(flm::sampling::request_seed(sampling_->effective()));
+    }
+
+    bool sampling_requires_fresh_generator() const {
+        // The supported OGA C API does not reset RNG state during RewindTo.
+        return sampling_->requires_fresh_generator();
+    }
+
+    void log_sampling_settings(bool reused) const {
+        if (params_ && flm::hip_oga::getenv_flag_enabled("FLM_HIP_OGA_DIAGNOSTICS")) {
+            auto effective = sampling_->effective();
+            effective["sampler"] = flm::sampling::provider_name(sampling_->provider());
+            effective["generator_reused"] = reused;
+            header_print("FLM", "HIP OGA sampling effective=" + effective.dump());
+            if (sampling_->provider() == flm::sampling::Provider::Common ||
+                flm::hip_oga::requires_logits_processing(sampling_->effective()))
+                header_print("FLM", "HIP OGA sampling runtime=" +
+                    flm::hip_oga::read_oga_sampling_options(*params_).dump());
+        }
     }
 
     void set_requested_max_tokens(int max_tokens) {
@@ -868,9 +995,6 @@ public:
 
     void reset_decoder_stream() {
         token_stream_.reset();
-        if (multimodal_turn_) {
-            token_stream_ = OgaTokenizerStream::Create(*processor_);
-        }
     }
 
     std::uint32_t native_text_required_max_length(std::size_t prompt_token_count) const {
@@ -888,6 +1012,8 @@ public:
         signature << "provider=" << provider_
                   << ";profile=" << profile_
                   << ";ctx=" << context_length_
+                  << ";search=" << sampling_->effective().dump()
+                  << ";sampler=" << flm::sampling::provider_name(sampling_->provider())
                   << ";request=" << request_signature;
         return signature.str();
     }
@@ -916,15 +1042,27 @@ public:
         if (converted.empty()) {
             throw std::runtime_error("HIP OGA tokenizer produced no prompt tokens");
         }
-        generator_->AppendTokens(converted.data(), converted.size());
+        if (gemma3_model_ && !flat_gemma3_features_) {
+            empty_image_inputs_ = std::make_unique<HipOgaEmptyImageInputs>(converted);
+            generator_->SetInputs(*empty_image_inputs_->inputs);
+            if (generator_->GetSequenceCount(0) != converted.size() ||
+                !std::equal(converted.begin(), converted.end(), generator_->GetSequenceData(0))) {
+                throw std::runtime_error("OGA empty-image inputs changed prompt token IDs");
+            }
+            if (flm::hip_oga::getenv_flag_enabled("FLM_HIP_OGA_DIAGNOSTICS"))
+                header_print("FLM", "HIP OGA no-image input contract=gemma3_empty_batch_v1 tokens=" +
+                    std::to_string(converted.size()));
+        } else {
+            generator_->AppendTokens(converted.data(), converted.size());
+        }
         accepted_token_count_ = converted.size();
         checkpoint_token_count_ = accepted_token_count_;
     }
 
-    std::size_t begin_multimodal_turn(
+    HipOgaPreparedMedia prepare_multimodal_turn(
         const std::string& prompt,
-        const std::vector<HipOgaImageInput>& images) {
-        reset_generator(effective_oga_max_length(1));
+        const std::vector<HipOgaImageInput>& images,
+        bool capture_identity) {
         if (!processor_) {
             try {
                 processor_ = OgaMultiModalProcessor::Create(*model_);
@@ -935,48 +1073,182 @@ public:
             }
         }
 
-        auto loaded_images = load_hip_oga_images(images);
-        auto inputs = processor_->ProcessImages(prompt.c_str(), loaded_images.images.get());
-        const std::size_t prompt_token_count = read_oga_prompt_token_count(*inputs);
-        if (prompt_token_count >= context_length_) {
+        HipOgaPreparedMedia prepared;
+        prepared.loaded_images = load_hip_oga_images(images);
+        prepared.inputs = flm::hip_oga::with_image_input_errors([&] {
+            return processor_->ProcessImages(prompt.c_str(), prepared.loaded_images.images.get());
+        });
+        prepared.tokens = read_oga_token_tensor(*prepared.inputs, "input_ids");
+        if (prepared.inputs->Get("input_ids")->Type() != OgaElementType_int32) {
+            throw std::runtime_error("OGA SetInputs requires int32 processor input_ids");
+        }
+        if (prepared.tokens.size() >= context_length_) {
             throw std::runtime_error(
                 "HIP OGA multimodal prompt reached the model context length");
         }
+        if (gemma3_model_) {
+            auto count = prepared.inputs->Get("num_image_tokens");
+            const auto pixels = prepared.inputs->Get("pixel_values");
+            if (count->Type() != OgaElementType_int64 ||
+                count->Shape() != std::vector<std::int64_t>{1} || count->Data() == nullptr ||
+                (pixels->Type() != OgaElementType_float16 && pixels->Type() != OgaElementType_float32 &&
+                 pixels->Type() != OgaElementType_bfloat16)) {
+                throw std::runtime_error("Gemma processor tensor type or count shape mismatch");
+            }
+            const auto token_types = read_oga_token_tensor(*prepared.inputs, "token_type_ids");
+            const auto per_image = *static_cast<const std::int64_t*>(count->Data());
+            const auto total = flm::hip_oga::gemma3_total_image_tokens(
+                prepared.loaded_images.buffers.size(), pixels->Shape(),
+                per_image, token_types);
+            flm::hip_oga::validate_gemma3_token_layout(
+                prepared.tokens, token_types, image_token_id_, total);
+            // The real processor owns this CPU scalar. The rank-2 package
+            // contract changes it from per-image to total feature rows.
+            if (flat_gemma3_features_) *static_cast<std::int64_t*>(count->Data()) = total;
+            prepared.input_contract = {
+                {"processor", "oga"}, {"model_type", "gemma3"},
+                {"feature_layout", flat_gemma3_features_ ? "gemma3_flat_tokens_v1" : "native"},
+                {"image_count", prepared.loaded_images.buffers.size()},
+                {"input_tokens", prepared.tokens.size()}, {"token_types", token_types.size()},
+                {"image_token_id", image_token_id_}, {"image_tokens", total},
+                {"per_image_tokens", per_image}, {"pixel_shape", pixels->Shape()},
+                {"pixel_type", static_cast<int>(pixels->Type())},
+                {"effective_num_image_tokens", *static_cast<const std::int64_t*>(count->Data())}};
+        }
+        if (capture_identity && media_rewind_qualified_) {
+            const auto names = prepared.inputs->GetNames();
+            std::vector<std::string> sorted_names;
+            for (std::size_t i = 0; i < names->Count(); ++i) sorted_names.emplace_back(names->Get(i));
+            std::sort(sorted_names.begin(), sorted_names.end());
+            // AppendTokens reconstructs text positions/masks, not arbitrary
+            // processor metadata. Unknown input semantics must take the fresh path.
+            if (sorted_names == std::vector<std::string>{"input_ids", "num_image_tokens",
+                                                         "pixel_values", "token_type_ids"}) {
+                flm::hip_oga::MediaCacheIdentity identity;
+                identity.processor_signature = media_processor_signature_;
+                identity.token_types = read_oga_token_tensor(*prepared.inputs, "token_type_ids");
+                identity.processor_tensors.push_back(copy_oga_media_tensor(*prepared.inputs, "num_image_tokens"));
+                identity.processor_tensors.push_back(copy_oga_media_tensor(*prepared.inputs, "pixel_values"));
+                // OgaImages was loaded from these buffers; no second file read.
+                identity.images = std::move(prepared.loaded_images.buffers);
+                prepared.identity = std::move(identity);
+            }
+        }
+        return prepared;
+    }
 
-        reset_generator(effective_oga_max_length(prompt_token_count));
-        generator_->SetInputs(*inputs);
+    std::uint32_t media_required_max_length(std::size_t prompt_tokens) const {
+        return effective_oga_max_length(prompt_tokens);
+    }
+
+    void begin_multimodal_turn(const HipOgaPreparedMedia& prepared, bool reserve_context) {
+        reset_generator(reserve_context ? context_length_ : effective_oga_max_length(prepared.tokens.size()));
+        generator_->SetInputs(*prepared.inputs);
         multimodal_turn_ = true;
         reset_decoder_stream();
-        accepted_token_count_ = prompt_token_count;
+        accepted_token_count_ = prepared.tokens.size();
         checkpoint_token_count_ = accepted_token_count_;
-        return prompt_token_count;
     }
 
     bool is_done() {
         return generator_ == nullptr || generator_->IsDone();
     }
 
-    bool generate_next_token(int& token) {
+    bool generate_next_token(int& token, decode_constraint* constraint = nullptr,
+                             const std::vector<int>* decoder_bans = nullptr) {
         if (!generator_) {
             throw std::runtime_error("HIP OGA generator is not initialized for this turn");
         }
         if (generator_->IsDone()) return false;
 
         const std::size_t before_count = generator_->GetSequenceCount(0);
+        std::vector<std::uint32_t> mask;
+        std::vector<float> scores;
+        std::unique_ptr<OgaTensor> constrained_logits;
+        bool masked = false;
+        const bool grammar_masked = constraint && constraint->fill_mask(mask);
+        const bool filter_decoder = constraint && decoder_bans && !decoder_bans->empty();
+        const bool process_sampling = flm::hip_oga::requires_logits_processing(sampling_->effective());
+        const bool common_sampling = sampling_->provider() == flm::sampling::Provider::Common;
+        int common_token = -1;
+        if (grammar_masked || filter_decoder || process_sampling || common_sampling) {
+            // GetLogits computes the current step in this runtime. SetLogits only
+            // replaces an existing buffer; keep our owned memory through sampling.
+            auto current = generator_->GetLogits();
+            const auto shape = current->Shape();
+            if (shape.empty() || shape.back() <= 0 || current->Data() == nullptr ||
+                std::any_of(shape.begin(), shape.end() - 1, [](auto dim) { return dim != 1; }))
+                throw std::runtime_error("HIP OGA sampling/constraints require one logits row");
+            scores.resize(static_cast<std::size_t>(shape.back()));
+            if (current->Type() == OgaElementType_float32) {
+                const auto* data = static_cast<const float*>(current->Data());
+                std::copy(data, data + scores.size(), scores.begin());
+            } else if (current->Type() == OgaElementType_bfloat16) {
+                const auto* bytes = static_cast<const unsigned char*>(current->Data());
+                for (std::size_t i = 0; i < scores.size(); ++i) {
+                    bf16 value;
+                    std::memcpy(&value, bytes + i * sizeof(value), sizeof(value));
+                    scores[i] = static_cast<float>(value);
+                }
+            } else {
+                throw std::runtime_error("HIP OGA sampling/constraints support float32 or bfloat16 logits");
+            }
+            if (grammar_masked || filter_decoder) {
+                if (!grammar_masked) mask.assign((scores.size() + 31) / 32, 0xFFFFFFFFu);
+                if (filter_decoder)
+                    flm::hip_oga::exclude_constraint_tokens(mask, scores.size(), *decoder_bans);
+                flm::hip_oga::mask_constraint_logits(scores, mask);
+                masked = true;
+            }
+            if (common_sampling) {
+                flm::hip_oga::mask_oga_sampling_logits(scores, generator_->GetSequenceCount(0),
+                                                       *params_, model_eos_ids_);
+                common_token = common_sampler_.sample(std::move(scores), generator_->GetSequenceData(0),
+                    generator_->GetSequenceCount(0), flm::sampling::sampling_logits_options(sampling_->effective()));
+                scores.assign(static_cast<std::size_t>(shape.back()), -std::numeric_limits<float>::infinity());
+                scores.at(static_cast<std::size_t>(common_token)) = 0;
+            } else if (process_sampling)
+                flm::hip_oga::process_oga_sampling_logits(scores, generator_->GetSequenceData(0),
+                    generator_->GetSequenceCount(0), sampling_->effective(), *params_, model_eos_ids_);
+            constrained_logits = OgaTensor::Create(scores.data(), shape.data(), shape.size(), OgaElementType_float32);
+            generator_->SetLogits(*constrained_logits);
+        }
         generator_->GenerateNextToken();
         const std::size_t after_count = generator_->GetSequenceCount(0);
+        if (common_sampling) {
+            // On the pinned runtime EOS is returned but is not appended. Verify
+            // it through GetNextTokens/IsDone, never through the sequence tail.
+            const auto selected = generator_->GetNextTokens();
+            if (selected.size() != 1 || selected[0] != common_token)
+                throw std::runtime_error("OGA did not commit the common sampler's selected token");
+            const bool eos = std::find(model_eos_ids_.begin(), model_eos_ids_.end(), common_token) != model_eos_ids_.end();
+            if (eos) {
+                if (!generator_->IsDone() || after_count != before_count)
+                    throw std::runtime_error("Unexpected OGA common-sampler EOS transition");
+                return false; // Preserve the existing FLM/OGA EOS output accounting.
+            }
+            if (after_count != before_count + 1)
+                throw std::runtime_error("OGA common-sampler token was not appended exactly once");
+        }
         if (after_count <= before_count) return false;
 
         const int32_t* sequence = generator_->GetSequenceData(0);
         token = static_cast<int>(sequence[after_count - 1]);
+        if (masked && !flm::hip_oga::constraint_token_allowed(mask, token, scores.size()))
+            throw std::runtime_error("HIP OGA sampled a token forbidden by the request constraint");
+        if (constraint) constraint->accept(token);
         accepted_token_count_ = after_count;
         return true;
     }
 
     std::string decode_token(int token) {
         if (!token_stream_) {
-            ensure_native_tokenizer();
-            token_stream_ = OgaTokenizerStream::Create(*tokenizer_);
+            if (multimodal_turn_) {
+                token_stream_ = OgaTokenizerStream::Create(*processor_);
+            } else {
+                ensure_native_tokenizer();
+                token_stream_ = OgaTokenizerStream::Create(*tokenizer_);
+            }
         }
         const char* decoded = token_stream_->Decode(static_cast<int32_t>(token));
         return decoded == nullptr ? std::string() : std::string(decoded);
@@ -988,6 +1260,14 @@ public:
         const auto decoded = tokenizer_->Decode(converted.data(), converted.size());
         const char* decoded_text = decoded;
         return decoded_text == nullptr ? std::string() : std::string(decoded_text);
+    }
+
+    bool decoder_token_matches(int token, const std::string& expected) {
+        if (decode_tokens({token}) != expected) return false;
+        // A private fresh stream leaves the request's decoder state untouched.
+        auto stream = OgaTokenizerStream::Create(*tokenizer_);
+        const char* decoded = stream->Decode(static_cast<int32_t>(token));
+        return decoded != nullptr && expected == decoded;
     }
 
 private:
@@ -1013,9 +1293,12 @@ private:
     }
 
     void reset_generator(std::uint32_t max_length) {
+        generator_.reset();
+        empty_image_inputs_.reset();
         params_ = OgaGeneratorParams::Create(*model_);
         params_->SetSearchOption("batch_size", 1);
         params_->SetSearchOption("max_length", static_cast<double>(max_length));
+        flm::hip_oga::apply_oga_sampling_options(*params_, sampling_->effective(), sampling_->provider());
         generator_ = OgaGenerator::Create(*model_, *params_);
         generator_max_length_ = max_length;
         multimodal_turn_ = false;
@@ -1026,6 +1309,7 @@ private:
 
     void release_generator() {
         generator_.reset();
+        empty_image_inputs_.reset();
         params_.reset();
         token_stream_.reset();
         multimodal_turn_ = false;
@@ -1107,12 +1391,23 @@ private:
     std::string profile_;
     std::string offload_policy_;
     std::uint32_t requested_max_tokens_ = kDefaultRequestedMaxTokens;
+    // Declared first so the view outlives every OGA object below.
+    std::unique_ptr<flm::hip_oga::ScopedConfigDirectory> config_directory_;
     std::unique_ptr<OgaConfig> config_;
     std::unique_ptr<OgaModel> model_;
+    std::unique_ptr<flm::hip_oga::SamplingState> sampling_;
+    flm::sampling::CpuSampler common_sampler_;
+    std::vector<int> model_eos_ids_;
     std::unique_ptr<OgaTokenizer> tokenizer_;
     std::unique_ptr<OgaMultiModalProcessor> processor_;
+    bool media_rewind_qualified_ = false;
+    bool flat_gemma3_features_ = false;
+    bool gemma3_model_ = false;
+    int image_token_id_ = -1;
+    std::string media_processor_signature_;
     std::unique_ptr<OgaTokenizerStream> token_stream_;
     bool multimodal_turn_ = false;
+    std::unique_ptr<HipOgaEmptyImageInputs> empty_image_inputs_;
     std::unique_ptr<OgaGeneratorParams> params_;
     std::unique_ptr<OgaGenerator> generator_;
     std::uint32_t generator_max_length_ = 0;
@@ -1170,8 +1465,64 @@ std::string decode_token_with_selected_provider(
 
 }  // namespace
 
+namespace flm::backend {
+namespace {
+class HipOgaBackend final : public ModelBackend {
+public:
+    explicit HipOgaBackend(const BackendContext& context)
+        : engine_(std::make_unique<HipOgaCausalLm>(
+              context.model_path, context.model_info, context.context_length)) {}
+    causal_lm& engine() override { return *engine_; }
+    std::string id() const override { return kHipOgaBackendId; }
+    bool supports_preemption() const override { return false; }
+    bool forwards_past_eos() const override { return false; }
+private:
+    std::unique_ptr<HipOgaCausalLm> engine_;
+};
+} // namespace
+
+void register_hip_oga_backends(BackendRegistry& registry) {
+    // instance() must not be called during builtin registration.
+    const char* families[] = {
+        "hip-oga", "llama3", "deepseek-r1", "deepseek-r1-0528", "qwen2",
+        "qwen2vl", "qwen3", "qwen3-it", "qwen3-tk", "qwen3vl", "qwen3vl-flash",
+        "qwen3.5", "qwen3.6-moe", "gemma3", "gemma3-text", "gemma4e",
+        "gemma4e-flash", "gemma4-12b", "hunyuan", "gpt-oss", "lfm2",
+        "lfm2.5-tk", "nanbeige", "phi4"
+    };
+    for (const auto* family : families) {
+        registry.register_backend(family, kHipOgaBackendId,
+            [](const BackendContext& context) {
+                if (context.enable_preemption || context.context_length == 0) {
+                    throw std::invalid_argument("Invalid HIP OGA backend context");
+                }
+                return std::make_unique<HipOgaBackend>(context);
+            }, BackendTraits{false, false, 0});
+    }
+}
+} // namespace flm::backend
+
 HipOgaModel::HipOgaModel() : AutoModel(nullptr, "HIP OGA") {
     forward_on_eos = false;
+}
+
+std::shared_ptr<decode_constraint> HipOgaModel::make_constraint(const chat_constraint_request& request) {
+    if (!this->is_model_loaded || !this->tokenizer || !this->lm_config)
+        throw std::invalid_argument("Load the HIP OGA model before creating a constraint");
+    chat_vocab vocab;
+    vocab.size = this->lm_config->get("vocab_size");
+    vocab.stop_tokens = this->eos_token_ids;
+    vocab.tokenizer_json = (std::filesystem::path(this->model_path) / "tokenizer.json").string();
+    vocab.encode = [this](const std::string& text) {
+        auto tokens = this->tokenizer->encode(text);
+        if (this->has_bos_token && !tokens.empty() && tokens.front() == this->bos_token_id)
+            tokens.erase(tokens.begin());
+        return tokens;
+    };
+    return chat_make_constraint(this->chat_format, request, vocab, [&]() -> chat_grammar_engine& {
+        if (!grammar_engine_) grammar_engine_ = std::make_unique<chat_grammar_engine>(vocab, this->chat_format);
+        return *grammar_engine_;
+    });
 }
 
 void HipOgaModel::clear_context() {
@@ -1182,7 +1533,20 @@ void HipOgaModel::clear_context() {
 void HipOgaModel::load_model(std::string model_path,
                              json model_info,
                              int default_context_length,
-                             bool enable_preemption) {
+                             bool enable_preemption,
+                             const std::string& backend) {
+    auto& registry = flm::backend::BackendRegistry::instance();
+    const std::string family = flm::backend::hip_oga_backend_family(
+        registry, model_info.value("details", json::object()).value("family", "hip-oga"));
+    const std::string id = flm::backend::resolve_backend_id(family, "hip", backend);
+    if (id != flm::backend::kHipOgaBackendId) {
+        throw std::invalid_argument("HIP OGA frontend requires backend hip");
+    }
+    const int context_length = default_context_length != -1
+        ? default_context_length : model_info.at("default_context_length").get<int>();
+    if (context_length < 1) {
+        throw std::runtime_error("HIP OGA context length must be positive");
+    }
     if (enable_preemption) {
         throw std::runtime_error("HIP OGA backend does not support NPU preemption");
     }
@@ -1191,39 +1555,38 @@ void HipOgaModel::load_model(std::string model_path,
         return;
     }
 
-    this->model_path = std::move(model_path);
-    header_print("FLM", "Loading model: " << this->model_path);
-    this->lm_config = std::make_unique<LM_Config>();
-    load_hip_oga_lm_config(*this->lm_config, this->model_path, model_info);
-
-    const int context_length = default_context_length != -1
-        ? default_context_length
-        : model_info["default_context_length"].get<int>();
-    if (context_length < 1) {
-        throw std::runtime_error("HIP OGA context length must be positive");
-    }
-    this->MAX_L = static_cast<std::uint32_t>(context_length);
-    this->token_history.clear();
-    this->token_history.reserve(this->MAX_L);
-    this->last_token = -1;
-    this->total_tokens = 0;
-    this->npu.reset();
-    this->enable_preemption = false;
-    this->tool_start_token_id_ = -1;
+    _release_model_state();
     this->prefix_cache_.reset_session();
     this->prefix_cache_request_signature_ = "{}";
-    this->tokenizer_fingerprint_ =
-        tokenizer_fingerprint_for_model(this->model_path);
-    const auto codec_config = flm::hip_oga::text_codec_config_from_environment();
-    this->tokenizer_provider_selector_ = codec_config.tokenizer;
-    this->decoder_provider_selector_ = codec_config.decoder;
-    this->active_decoder_provider_selector_ = this->decoder_provider_selector_;
-    const std::string configured_provider_signature =
-        provider_signature(tokenizer_provider_selector_, decoder_provider_selector_,
-                           this->tokenizer_fingerprint_);
-    header_print("FLM", "HIP OGA text codec selectors " + configured_provider_signature);
-
     try {
+        this->model_path = std::move(model_path);
+        this->grammar_engine_.reset();
+        this->constrained_decoder_bans_.reset();
+        header_print("FLM", "Loading model: " << this->model_path);
+        this->lm_config = std::make_unique<LM_Config>();
+        load_hip_oga_lm_config(*this->lm_config, this->model_path, model_info);
+
+        this->MAX_L = static_cast<std::uint32_t>(context_length);
+        this->token_history.clear();
+        this->token_history.reserve(this->MAX_L);
+        this->last_token = -1;
+        this->total_tokens = 0;
+        this->npu.reset();
+        this->enable_preemption = false;
+        this->tool_start_token_id_ = -1;
+        this->prefix_cache_.reset_session();
+        this->prefix_cache_request_signature_ = "{}";
+        this->tokenizer_fingerprint_ =
+            tokenizer_fingerprint_for_model(this->model_path);
+        const auto codec_config = flm::hip_oga::text_codec_config_from_environment();
+        this->tokenizer_provider_selector_ = codec_config.tokenizer;
+        this->decoder_provider_selector_ = codec_config.decoder;
+        this->active_decoder_provider_selector_ = this->decoder_provider_selector_;
+        const std::string configured_provider_signature =
+            provider_signature(tokenizer_provider_selector_, decoder_provider_selector_,
+                               this->tokenizer_fingerprint_);
+        header_print("FLM", "HIP OGA text codec selectors " + configured_provider_signature);
+
         this->tokenizer = std::make_unique<Tokenizer>(this->model_path);
         const auto model_root = std::filesystem::path(this->model_path);
         auto tokenizer_config =
@@ -1303,6 +1666,7 @@ void HipOgaModel::load_model(std::string model_path,
             tokenizer_config["chat_template"].get<std::string>(),
             this->bos_token,
             this->eos_token);
+        this->_detect_chat_format(tokenizer_config["chat_template"].get<std::string>());
         const std::vector<int> tool_start_tokens =
             this->tokenizer->encode("<tool_call>");
         if (tool_start_tokens.size() == 1) {
@@ -1310,26 +1674,33 @@ void HipOgaModel::load_model(std::string model_path,
         }
         this->user_system_prompt = "";
         this->extra_context["user_system_prompt"] = this->user_system_prompt;
-        this->lm_engine = std::make_unique<HipOgaCausalLm>(
-            this->model_path, model_info, this->MAX_L);
+        flm::backend::BackendContext context;
+        context.model_path = this->model_path;
+        context.model_info = model_info;
+        context.config = this->lm_config.get();
+        context.context_length = this->MAX_L;
+        context.tokenizer_config = &tokenizer_config;
+        this->backend_ = registry.create(family, id, context);
+        if (!this->backend_) throw std::runtime_error("HIP OGA factory returned no owner");
+        this->lm_engine = &this->backend_->engine();
+
+        sampler_config config;
+        config.top_k = 40;
+        config.top_p = 0.9;
+        config.min_p = 0.1;
+        config.temperature = 0.8;
+        this->set_sampler(config);
+
+        for (size_t i = 0; i < PROFILER_TYPE_NUM; i++) {
+            this->profiler_list[i].reset();
+        }
+        this->is_model_loaded = true;
     } catch (...) {
-        this->lm_engine.reset();
-        this->tokenizer.reset();
-        this->lm_config.reset();
-        this->is_model_loaded = false;
+        this->prefix_cache_.reset_session();
+        this->prefix_cache_request_signature_ = "{}";
+        this->tool_start_token_id_ = -1;
+        this->_release_model_state();
         throw;
-    }
-    this->is_model_loaded = true;
-
-    sampler_config config;
-    config.top_k = 40;
-    config.top_p = 0.9;
-    config.min_p = 0.1;
-    config.temperature = 0.8;
-    this->set_sampler(config);
-
-    for (size_t i = 0; i < PROFILER_TYPE_NUM; i++) {
-        this->profiler_list[i].reset();
     }
 }
 
@@ -1348,16 +1719,23 @@ std::string HipOgaModel::apply_chat_template(nlohmann::ordered_json& messages,
 bool HipOgaModel::insert(chat_meta_info_t& meta_info,
                          lm_uniform_input_t& input,
                          std::function<bool()> is_cancelled) {
+    ++this->diagnostic_request_sequence_;
     reject_hip_oga_audio_inputs(input);
     const std::vector<HipOgaImageInput> images =
         collect_hip_oga_image_inputs(input);
-    auto tokenizer_provider_selector = this->tokenizer_provider_selector_;
-    auto decoder_provider_selector = this->decoder_provider_selector_;
-    if (!images.empty()) {
-        force_oga_text_providers_for_media(tokenizer_provider_selector,
-                                           decoder_provider_selector);
+    const auto& tokenizer_provider_selector = this->tokenizer_provider_selector_;
+    this->active_decoder_provider_selector_ = this->decoder_provider_selector_;
+    this->active_media_input_ = !images.empty();
+    if (flm::hip_oga::getenv_flag_enabled("FLM_HIP_OGA_DIAGNOSTICS")) {
+        const nlohmann::json request_codec{
+            {"request_sequence", this->diagnostic_request_sequence_},
+            {"media", this->active_media_input_},
+            {"processor", this->active_media_input_ ? "oga" : "none"},
+            {"input_tokenizer", this->active_media_input_ ? "oga" : tokenizer_provider_selector.normalized_name},
+            {"requested_tokenizer", tokenizer_provider_selector.normalized_name},
+            {"decoder", this->active_decoder_provider_selector_.normalized_name}};
+        header_print("FLM", "HIP OGA request codec=" + request_codec.dump());
     }
-    this->active_decoder_provider_selector_ = decoder_provider_selector;
 
     this->profiler_list[TKOEN_ENCODE_TIME].start();
     std::string templated_text;
@@ -1368,12 +1746,16 @@ bool HipOgaModel::insert(chat_meta_info_t& meta_info,
     nlohmann::ordered_json messages =
         build_hip_oga_prompt_messages(input, images);
     templated_text = this->apply_chat_template(messages, input.tools);
+    // This is the exact text passed to the selected encoder or media processor.
+    // Do not create OGA tokenizer/decoder state just to initialize output parsing.
+    meta_info.prompt_tail = templated_text.substr(templated_text.size() > 4096 ? templated_text.size() - 4096 : 0);
 
-    auto* hip_engine = dynamic_cast<HipOgaCausalLm*>(this->lm_engine.get());
+    auto* hip_engine = dynamic_cast<HipOgaCausalLm*>(this->lm_engine);
     if (hip_engine == nullptr) {
         throw std::runtime_error("HIP OGA model is not backed by an OGA engine");
     }
 
+    hip_engine->begin_sampling_turn();
     std::size_t prompt_tokens = 0;
     if (images.empty()) {
         std::vector<int> tokens = encode_prompt_with_selected_provider(
@@ -1398,6 +1780,10 @@ bool HipOgaModel::insert(chat_meta_info_t& meta_info,
         // token prefix and backend compatibility, then OGA validates restoration.
         const std::string signature =
             hip_engine->prefix_cache_signature(prefix_cache_request_signature_);
+        const bool reset_sampling_rng = hip_engine->sampling_requires_fresh_generator();
+        if (reset_sampling_rng) {
+            prefix_cache_.reset_checkpoint("seeded_sampling_rng_reset");
+        }
         auto cache_decision = prefix_cache_.evaluate(
             hip_oga_prefix_cache_enabled(),
             meta_info.restore_allowed,
@@ -1406,6 +1792,9 @@ bool HipOgaModel::insert(chat_meta_info_t& meta_info,
             required_capacity,
             hip_engine->generator_capacity(),
             tokens);
+        if (reset_sampling_rng && hip_oga_prefix_cache_enabled() && meta_info.restore_allowed) {
+            cache_decision.reason = "seeded_sampling_rng_reset";
+        }
 
         auto prefill_start_time = this->profiler_list[PREFILL_TIME].start();
         try {
@@ -1430,6 +1819,7 @@ bool HipOgaModel::insert(chat_meta_info_t& meta_info,
             hip_engine->begin_turn(tokens);
         }
         const int checkpoint_idx = hip_engine->checkpoint_text_prompt();
+        hip_engine->log_sampling_settings(cache_decision.reuse);
         auto prefill_end_time =
             this->profiler_list[PREFILL_TIME].stop(cache_decision.newly_prefilled_tokens);
 
@@ -1448,24 +1838,97 @@ bool HipOgaModel::insert(chat_meta_info_t& meta_info,
             " newly_prefilled_tokens=" + std::to_string(cache_decision.newly_prefilled_tokens) +
             " checkpoint_tokens=" + std::to_string(checkpoint_idx));
     } else {
-        prefix_cache_.reset_checkpoint("multimodal_forced_miss");
-        this->profiler_list[TKOEN_ENCODE_TIME].stop(0);
-
+        // HIP OGA media prefill transaction: prepare without replacing live KV.
         if (is_cancelled()) {
+            this->clear_context();
+            meta_info.stop_reason = CANCEL_DETECTED;
+            return false;
+        }
+        const bool cache_enabled = hip_oga_prefix_cache_enabled();
+        auto prepared = hip_engine->prepare_multimodal_turn(templated_text, images,
+            cache_enabled);
+        if (flm::hip_oga::getenv_flag_enabled("FLM_HIP_OGA_DIAGNOSTICS") &&
+            !prepared.input_contract.is_null()) {
+            prepared.input_contract["request_sequence"] = this->diagnostic_request_sequence_;
+            header_print("FLM", "HIP OGA processor input=" + prepared.input_contract.dump());
+        }
+        this->profiler_list[TKOEN_ENCODE_TIME].stop(prepared.tokens.size());
+        const std::string signature =
+            hip_engine->prefix_cache_signature(prefix_cache_request_signature_);
+        const bool reset_sampling_rng = hip_engine->sampling_requires_fresh_generator();
+        if (reset_sampling_rng) prefix_cache_.reset_checkpoint("seeded_sampling_rng_reset");
+        auto cache_decision = prefix_cache_.evaluate(cache_enabled,
+            meta_info.restore_allowed, false, signature,
+            hip_engine->media_required_max_length(prepared.tokens.size()),
+            hip_engine->generator_capacity(), prepared.tokens,
+            prepared.identity ? &*prepared.identity : nullptr);
+        if (reset_sampling_rng && cache_enabled && meta_info.restore_allowed) {
+            cache_decision.reason = "seeded_sampling_rng_reset";
+        }
+        if (is_cancelled()) {
+            this->clear_context();
             meta_info.stop_reason = CANCEL_DETECTED;
             return false;
         }
 
+        // BEGIN HIP OGA MEDIA TRANSACTION (compiled unchanged by its test adapter)
         auto prefill_start_time = this->profiler_list[PREFILL_TIME].start();
-        prompt_tokens = hip_engine->begin_multimodal_turn(templated_text, images);
+        try {
+            if (cache_decision.reuse) {
+                hip_engine->restore_text_checkpoint();
+                const std::vector<int> suffix(prepared.tokens.begin() +
+                    static_cast<std::ptrdiff_t>(cache_decision.suffix_start), prepared.tokens.end());
+                hip_engine->append_text_suffix(suffix);
+            } else {
+                hip_engine->begin_multimodal_turn(prepared, cache_enabled && prepared.identity.has_value());
+            }
+        } catch (const std::exception& e) {
+            const bool was_reuse = cache_decision.reuse;
+            prefix_cache_.disable_for_session(std::string("provider_exception: ") + e.what());
+            hip_engine->clear_context();
+            if (!was_reuse) throw;
+            header_print("FLM", std::string("HIP OGA media prefix cache fallback: ") + e.what());
+            cache_decision = flm::hip_oga::PrefixCacheDecision{};
+            cache_decision.attempted = true;
+            cache_decision.reason = "provider_exception";
+            cache_decision.newly_prefilled_tokens = prepared.tokens.size();
+            try {
+                // Rebuild once from the same processor inputs and owned image bytes.
+                hip_engine->begin_multimodal_turn(prepared, false);
+            } catch (...) {
+                hip_engine->clear_context();
+                throw;
+            }
+        }
+        if (is_cancelled()) {
+            this->clear_context();
+            meta_info.stop_reason = CANCEL_DETECTED;
+            return false;
+        }
+        const int checkpoint_idx = hip_engine->checkpoint_text_prompt();
+        hip_engine->log_sampling_settings(cache_decision.reuse);
         auto prefill_end_time =
-            this->profiler_list[PREFILL_TIME].stop(prompt_tokens);
-
-        this->token_history.clear();
+            this->profiler_list[PREFILL_TIME].stop(cache_decision.newly_prefilled_tokens);
+        this->token_history = prepared.tokens;
         this->checkpoint_his.clear();
-        meta_info.cached_prompt_tokens = 0;
+        prompt_tokens = prepared.tokens.size();
+        meta_info.cached_prompt_tokens = static_cast<int>(cache_decision.cached_tokens);
         meta_info.prefill_duration =
             (uint64_t)time_utils::duration_ns(prefill_start_time, prefill_end_time).first;
+        if (cache_enabled && prepared.identity && !prefix_cache_.disabled_for_session()) {
+            prefix_cache_.commit_checkpoint(prepared.tokens, signature,
+                hip_engine->generator_capacity(), std::move(prepared.identity));
+        } else {
+            prefix_cache_.reset_checkpoint(cache_decision.reason);
+        }
+        header_print("FLM", "HIP OGA media prefix cache attempted=" +
+            std::string(cache_decision.attempted ? "1" : "0") +
+            " hit=" + std::string(cache_decision.reuse ? "1" : "0") +
+            " fallback=" + (cache_decision.reuse ? std::string("none") : cache_decision.reason) +
+            " cached_tokens=" + std::to_string(cache_decision.cached_tokens) +
+            " newly_prefilled_tokens=" + std::to_string(cache_decision.newly_prefilled_tokens) +
+            " checkpoint_tokens=" + std::to_string(checkpoint_idx));
+        // END HIP OGA MEDIA TRANSACTION
     }
 
     if (prompt_tokens > std::numeric_limits<std::uint32_t>::max() ||
@@ -1482,7 +1945,7 @@ std::string HipOgaModel::generate(chat_meta_info_t& meta_info,
                                   int length_limit,
                                   std::ostream& os,
                                   std::function<bool()> is_cancelled) {
-    auto* hip_engine = dynamic_cast<HipOgaCausalLm*>(this->lm_engine.get());
+    auto* hip_engine = dynamic_cast<HipOgaCausalLm*>(this->lm_engine);
     if (hip_engine == nullptr) {
         throw std::runtime_error("HIP OGA model is not backed by an OGA engine");
     }
@@ -1493,8 +1956,29 @@ std::string HipOgaModel::generate(chat_meta_info_t& meta_info,
     this->profiler_list[TKOEN_DECODE_TIME].reset();
     hip_engine->reset_decoder_stream();
 
+    if (meta_info.constraint)
+        meta_info.constraint->start(chat_format_prefill(this->chat_format, meta_info.prompt_tail));
+
     const auto decoder_execution =
         flm::hip_oga::text_codec_execution(this->active_decoder_provider_selector_);
+    const bool media_decode = this->active_media_input_;
+    std::size_t oga_decode_calls = 0;
+    std::size_t flm_decode_calls = 0;
+    std::string decoder_parity = "not_run";
+    const std::vector<int>* decoder_bans = nullptr;
+    if (meta_info.constraint && decoder_execution.use_oga) {
+        if (!constrained_decoder_bans_) {
+            constrained_decoder_bans_ = flm::hip_oga::incompatible_metaspace_tokens(
+                read_json_file_if_present(std::filesystem::path(this->model_path) / "tokenizer.json"),
+                [hip_engine](int token, const std::string& expected) {
+                    return hip_engine->decoder_token_matches(token, expected);
+                });
+            if (!constrained_decoder_bans_->empty())
+                header_print("FLM", "HIP OGA constrained decoder excluded_tokens=" +
+                    std::to_string(constrained_decoder_bans_->size()));
+        }
+        decoder_bans = &*constrained_decoder_bans_;
+    }
     const bool use_external_decoder_output = decoder_execution.output_flm;
     std::string native_decoded_text;
     std::vector<int> generated_token_ids;
@@ -1506,8 +1990,9 @@ std::string HipOgaModel::generate(chat_meta_info_t& meta_info,
             std::make_unique<flm::hip_oga::ExternalCumulativeDetokenizer>(
                 [&](const std::vector<int>& token_ids) {
                     try {
-                        return flm::hip_oga::CumulativeDecodeResult::match(
-                            fastflowlm_tokenizer.decode(token_ids));
+                        auto decoded = fastflowlm_tokenizer.decode(token_ids);
+                        ++flm_decode_calls;
+                        return flm::hip_oga::CumulativeDecodeResult::match(std::move(decoded));
                     } catch (const std::exception& e) {
                         return flm::hip_oga::CumulativeDecodeResult::error(
                             e.what());
@@ -1537,7 +2022,7 @@ std::string HipOgaModel::generate(chat_meta_info_t& meta_info,
 
         int sampled_token = -1;
         this->profiler_list[DECODING_TIME].start();
-        const bool generated = hip_engine->generate_next_token(sampled_token);
+        const bool generated = hip_engine->generate_next_token(sampled_token, meta_info.constraint.get(), decoder_bans);
         this->profiler_list[DECODING_TIME].stop(1);
         if (!generated) {
             break;
@@ -1559,6 +2044,7 @@ std::string HipOgaModel::generate(chat_meta_info_t& meta_info,
         if (decoder_execution.use_oga && this->is_normal_token(sampled_token)) {
             token_str = decode_token_with_selected_provider(*hip_engine,
                                                             sampled_token);
+            ++oga_decode_calls;
             native_decoded_text += token_str;
         }
         if (external_decoder) {
@@ -1592,6 +2078,9 @@ std::string HipOgaModel::generate(chat_meta_info_t& meta_info,
             break;
         }
     }
+
+    if (is_cancelled()) reason = CANCEL_DETECTED;
+    if (reason == CANCEL_DETECTED) this->clear_context();
 
     if (external_decoder && reason != CANCEL_DETECTED) {
         const auto final_chunk = external_decoder->finish();
@@ -1653,6 +2142,7 @@ std::string HipOgaModel::generate(chat_meta_info_t& meta_info,
             }
             flm::hip_oga::TextCodecParityResult parity;
             parity.status = flm::hip_oga::ParityStatus::Match;
+            decoder_parity = "match";
             parity.oga_decoded_text = oga_full_decoded_text;
             parity.external_decoded_text = fastflowlm_full_decoded_text;
             header_print("FLM", "HIP OGA external decoder parity status=" +
@@ -1661,6 +2151,19 @@ std::string HipOgaModel::generate(chat_meta_info_t& meta_info,
                 flm::hip_oga::to_string(decoder_equivalence.equivalence_class) +
                 " bytes=" + std::to_string(parity.external_decoded_text.size()));
         }
+    }
+
+    if (flm::hip_oga::getenv_flag_enabled("FLM_HIP_OGA_DIAGNOSTICS")) {
+        const nlohmann::json decoder_execution_record{
+            {"request_sequence", this->diagnostic_request_sequence_},
+            {"media", media_decode},
+            {"decoder", this->active_decoder_provider_selector_.normalized_name},
+            {"output", use_external_decoder_output ? "flm" : "oga"},
+            {"decoded_tokens", decoder_token_ids.size()},
+            {"oga_decode_calls", oga_decode_calls}, {"flm_decode_calls", flm_decode_calls},
+            {"output_bytes", result.size()}, {"cancelled", reason == CANCEL_DETECTED},
+            {"parity", decoder_parity}};
+        header_print("FLM", "HIP OGA decoder execution=" + decoder_execution_record.dump());
     }
 
     meta_info.decoding_duration =
@@ -1690,9 +2193,16 @@ std::string HipOgaModel::generate_with_prompt(chat_meta_info_t& meta_info,
 
 bool HipOgaModel::configure_parameter(std::string parameter_name,
                                       const std::any& value) {
+    if (parameter_name == "hip_oga_sampling_request" || parameter_name == "hip_oga_sampling_update") {
+        auto* hip_engine = dynamic_cast<HipOgaCausalLm*>(this->lm_engine);
+        if (hip_engine == nullptr) throw std::logic_error("HIP OGA sampling needs a loaded model");
+        hip_engine->configure_sampling(std::any_cast<const nlohmann::json&>(value),
+                                      parameter_name == "hip_oga_sampling_request");
+        return true;
+    }
     if (parameter_name == "hip_oga_requested_max_tokens") {
         try {
-            auto* hip_engine = dynamic_cast<HipOgaCausalLm*>(this->lm_engine.get());
+            auto* hip_engine = dynamic_cast<HipOgaCausalLm*>(this->lm_engine);
             if (hip_engine == nullptr) return false;
             hip_engine->set_requested_max_tokens(std::any_cast<int>(value));
             return true;
@@ -1724,11 +2234,15 @@ bool HipOgaModel::configure_parameter(std::string parameter_name,
 
 HipOgaModel::HipOgaModel() : AutoModel(nullptr, "HIP OGA") {}
 
+std::shared_ptr<decode_constraint> HipOgaModel::make_constraint(const chat_constraint_request&) {
+    throw std::invalid_argument("HIP OGA constrained output requires a HIP-enabled build");
+}
+
 void HipOgaModel::clear_context() {
     AutoModel::clear_context();
 }
 
-void HipOgaModel::load_model(std::string, json, int, bool) {
+void HipOgaModel::load_model(std::string, json, int, bool, const std::string&) {
     throw std::runtime_error(
         "HIP OGA backend requires a build configured with -DFLM_ENABLE_HIP_OGA=ON");
 }
@@ -1764,6 +2278,38 @@ std::string HipOgaModel::apply_chat_template(nlohmann::ordered_json&,
 }
 
 #endif  // FLM_ENABLE_HIP_OGA
+
+void HipOgaModel::update_sampling_option(const char* name, double value) {
+    configure_sampling_request(nlohmann::json{{name, value}}, false);
+}
+
+void HipOgaModel::set_sampling_provider(const std::string& name) {
+#ifdef FLM_ENABLE_HIP_OGA
+    auto* engine = dynamic_cast<HipOgaCausalLm*>(this->lm_engine);
+    if (!engine) throw flm::sampling::SamplingRequestError("HIP OGA sampling needs a loaded model");
+    engine->set_sampling_provider(name);
+#else
+    throw flm::sampling::SamplingRequestError("HIP OGA backend is not enabled in this build");
+#endif
+}
+
+void HipOgaModel::configure_sampling_request(const nlohmann::json& options, bool reset) {
+#ifdef FLM_ENABLE_HIP_OGA
+    auto* engine = dynamic_cast<HipOgaCausalLm*>(this->lm_engine);
+    if (!engine) throw flm::sampling::SamplingRequestError("HIP OGA sampling needs a loaded model");
+    engine->configure_sampling(options, reset);
+#else
+    throw flm::sampling::SamplingRequestError("HIP OGA backend is not enabled in this build");
+#endif
+}
+
+void HipOgaModel::set_topk(int value) { update_sampling_option("top_k", value); }
+void HipOgaModel::set_topp(float value) { update_sampling_option("top_p", value); }
+void HipOgaModel::set_minp(float value) { update_sampling_option("min_p", value); }
+void HipOgaModel::set_temperature(float value) { update_sampling_option("temperature", value); }
+void HipOgaModel::set_presence_penalty(float value) { update_sampling_option("presence_penalty", value); }
+void HipOgaModel::set_repetition_penalty(float value) { update_sampling_option("repetition_penalty", value); }
+void HipOgaModel::set_frequency_penalty(float value) { update_sampling_option("frequency_penalty", value); }
 
 int HipOgaModel::get_tool_start_token_id() const {
     return this->tool_start_token_id_;

@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <functional>
+#include <limits>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -473,6 +475,39 @@ inline DecoderCanonicalizationPolicy decoder_policy_from_tokenizer_contract(
     return policy;
 }
 
+// XGrammar follows the tokenizer's metaspace-to-space contract. Some OGA
+// decoders preserve a standalone multi-metaspace token literally instead.
+// Filter only proven incompatible IDs; do not rewrite generated JSON strings.
+inline std::vector<int> incompatible_metaspace_tokens(
+    const nlohmann::json& tokenizer_json,
+    const std::function<bool(int, const std::string&)>& decoder_matches) {
+    if (!tokenizer_json_has_metaspace_decoder_contract(tokenizer_json)) return {};
+    std::map<int, std::string> candidates;
+    const auto record = [&](const nlohmann::json& id, const std::string& token) {
+        if (!id.is_number_integer() || id.get<double>() < 0 ||
+            id.get<double>() > std::numeric_limits<int>::max()) return;
+        const int index = id.get<int>();
+        if (token_is_only_metaspace(token)) candidates[index] = std::string(token.size() / 3, ' ');
+        else candidates.erase(index);
+    };
+    const auto& model = tokenizer_json.value("model", nlohmann::json::object());
+    const auto& vocab = model.value("vocab", nlohmann::json::object());
+    if (vocab.is_object()) {
+        for (auto item = vocab.begin(); item != vocab.end(); ++item) record(item.value(), item.key());
+    }
+    const auto& added = tokenizer_json.value("added_tokens", nlohmann::json::array());
+    if (added.is_array()) {
+        for (const auto& entry : added) {
+            if (entry.is_object() && entry.contains("id") && entry.contains("content") &&
+                entry["content"].is_string()) record(entry["id"], entry["content"].get<std::string>());
+        }
+    }
+    std::vector<int> excluded;
+    for (const auto& [id, expected] : candidates)
+        if (!decoder_matches(id, expected)) excluded.push_back(id);
+    return excluded;
+}
+
 inline DecoderEquivalenceResult classify_decoder_text_equivalence(
     const std::string& oga_text,
     const std::string& external_text,
@@ -573,9 +608,20 @@ private:
             return fail("external cumulative decode revised emitted prefix", final);
         }
 
-        const std::size_t stable_prefix =
+        std::size_t stable_prefix =
             final ? decoded.text.size()
                   : common_prefix_length(previous_cumulative_, decoded.text);
+        if (!final) {
+            // ByteFallback can return one U+FFFD per incomplete byte for several
+            // tokens before resolving them into a single Unicode scalar. Even
+            // repeated replacement characters at the end are not stable yet.
+            constexpr std::string_view replacement = "\xEF\xBF\xBD";
+            std::size_t resolved_end = decoded.text.size();
+            while (resolved_end >= replacement.size() &&
+                   decoded.text.compare(resolved_end - replacement.size(), replacement.size(), replacement) == 0)
+                resolved_end -= replacement.size();
+            stable_prefix = std::min(stable_prefix, resolved_end);
+        }
         auto chunk = emit_stable_prefix(decoded.text, stable_prefix, final);
         previous_cumulative_ = decoded.text;
         return chunk;

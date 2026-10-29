@@ -14,6 +14,7 @@
 #include "model_downloader.hpp"
 #include "cli_wide.hpp"
 #include "program_args.hpp"
+#include "chat/cli_tools.hpp"
 #include "image/image_reader.hpp"
 #ifndef FASTFLOWLM_LINUX_LIMITED_MODELS
 #include "whisper/modeling_whisper.hpp"
@@ -49,6 +50,7 @@ class Runner {
     private:
         std::string tag;
         std::string initial_prompt;
+        std::unique_ptr<flm::chat::cli_tools_session> tool_session;
         bool modelscope;
         int prefill_chunk_len;
         bool asr;
@@ -66,12 +68,14 @@ class Runner {
         std::string system_prompt;
         bool preemption;
         std::string backend;
+        std::string sampler_provider;
         int img_pre_resize;
         // CLI instance for interactive input
         CLIWide cli;
         std::unique_ptr<flm_rt::device> npu_device_inst;
 
         flm_rt::device* ensure_npu_device();
+        bool generate_tools(const std::string& input, std::ostream& output);
         bool generate_once(const std::string& input, std::ostream& base_ostream);
 
         /// \brief Command functions

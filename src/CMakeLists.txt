@@ -377,6 +377,60 @@ endif()
 
 
 add_executable(flm ${SOURCES} ${HEADERS})
+include("${CMAKE_CURRENT_SOURCE_DIR}/common/chat/chat_sources.cmake")
+target_link_libraries(flm PRIVATE flm_xgrammar)
+
+option(FLM_BUILD_BACKEND_LIFECYCLE_TESTS "Build device-free AutoModel lifecycle tests" OFF)
+if(FLM_BUILD_BACKEND_LIFECYCLE_TESTS)
+    # Link the production lifecycle code and the CLI's qualified dependencies.
+    # The test registry supplies an empty engine; it never opens an NPU or GPU.
+    add_executable(test_automodel_lifecycle
+        test/model_backend/test_automodel_lifecycle.cpp
+        common/AutoModel/automodel.cpp
+        common/AutoModel/model_backend.cpp
+        common/chat/chat_format.cpp
+        common/tokenizer/tokenizer.cpp
+        common/modules/sampler.cpp
+        common/utils.cpp)
+    target_include_directories(test_automodel_lifecycle PRIVATE
+        $<TARGET_PROPERTY:flm,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(test_automodel_lifecycle PRIVATE
+        $<TARGET_PROPERTY:flm,COMPILE_DEFINITIONS>)
+    target_compile_options(test_automodel_lifecycle PRIVATE
+        $<TARGET_PROPERTY:flm,COMPILE_OPTIONS>)
+    target_link_directories(test_automodel_lifecycle PRIVATE
+        $<TARGET_PROPERTY:flm,LINK_DIRECTORIES>)
+    target_link_libraries(test_automodel_lifecycle PRIVATE
+        $<TARGET_GENEX_EVAL:flm,$<TARGET_PROPERTY:flm,LINK_LIBRARIES>>)
+    enable_testing()
+    add_test(NAME automodel_lifecycle COMMAND test_automodel_lifecycle)
+endif()
+
+option(FLM_BUILD_CHAT_HTTP_TESTS "Build device-free tests of the actual OpenAI streambuf" OFF)
+if(FLM_BUILD_CHAT_HTTP_TESTS)
+    file(GLOB CHAT_OUTPUT_SOURCES "common/chat/*.cpp")
+    add_executable(test_chat_http
+        test/chat_output/test_chat_http.cpp
+        common/AutoModel/automodel.cpp
+        common/AutoModel/model_backend.cpp
+        common/tokenizer/tokenizer.cpp
+        common/modules/sampler.cpp
+        common/utils.cpp
+        ${CHAT_OUTPUT_SOURCES})
+    target_include_directories(test_chat_http PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/server"
+        $<TARGET_PROPERTY:flm,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(test_chat_http PRIVATE $<TARGET_PROPERTY:flm,COMPILE_DEFINITIONS>)
+    target_compile_options(test_chat_http PRIVATE $<TARGET_PROPERTY:flm,COMPILE_OPTIONS>)
+    if(MSVC)
+        target_compile_options(test_chat_http PRIVATE /utf-8)
+    endif()
+    target_link_directories(test_chat_http PRIVATE $<TARGET_PROPERTY:flm,LINK_DIRECTORIES>)
+    target_link_libraries(test_chat_http PRIVATE
+        $<TARGET_GENEX_EVAL:flm,$<TARGET_PROPERTY:flm,LINK_LIBRARIES>>)
+    enable_testing()
+    add_test(NAME chat_http COMMAND test_chat_http)
+endif()
 
 if(FLM_ENABLE_HIP_OGA)
     flm_find_ort_genai()

@@ -319,7 +319,7 @@ BenchmarkResults_t run_benchmarks(std::string model_tag,
     int max_len = bench_config["max_length"];
     if (!single_turn && max_len < 8192)
         max_len = 8192;
-    auto_chat_engine->load_model(model_path, model_info, max_len, false);
+    auto_chat_engine->load_model(model_path, model_info, max_len, false, resolved_backend);
     std::string input_text = bench_config["input_text"];
     auto [num_tokens, benchmark_text] = auto_chat_engine->prepare_benchmark(input_text);
 

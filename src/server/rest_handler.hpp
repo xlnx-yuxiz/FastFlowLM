@@ -113,6 +113,7 @@ private:
     void ensure_asr_model_loaded(const std::string& model_tag);
     void ensure_embed_model_loaded(const std::string& model_tag);
     flm_rt::device* ensure_npu_device();
+    void clear_cancelled_request() noexcept;
     void configure_chat_engine_parameters(const json& options, const json& request);
     json build_nstream_response(const NonStreamResult& result, chat_meta_info_t& meta_info);
 
@@ -128,6 +129,7 @@ private:
     std::string current_model_tag;
     std::string default_model_tag;
     std::string backend;
+    std::string sampler_provider;
     std::string current_backend;
     bool modelscope;
     bool asr;
@@ -139,5 +141,6 @@ private:
     int img_pre_resize;
     std::string last_question;
     bool preemption;
+    std::string model_used_for_last_message;
     PromptCache prompt_cache;
 };

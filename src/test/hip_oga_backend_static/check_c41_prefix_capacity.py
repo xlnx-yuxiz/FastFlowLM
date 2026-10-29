@@ -28,7 +28,7 @@ native = source.split(
     1,
 )[1].split("std::uint32_t generator_capacity() const", 1)[0]
 begin_turn = source.split("void begin_turn(const std::vector<int>& tokens)", 1)[1].split(
-    "std::size_t begin_multimodal_turn", 1
+    "\n    }", 1
 )[0]
 
 require(

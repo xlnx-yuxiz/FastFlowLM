@@ -5,9 +5,9 @@
             "14b": {
                 "name": "Qwen2.5-Coder-14B-Instruct-HIP-OGA",
                 "url": "https://huggingface.co/amd/Qwen2.5-Coder-14B-Instruct_gpuep_1.0_gpu_128",
-                "file_url": "https://huggingface.co/api/models/amd/Qwen2.5-Coder-14B-Instruct_gpuep_1.0_gpu_128/tree/6de529bb30355eac01ad8daab89cda657ddf0418",
+                "file_url": "https://huggingface.co/api/models/amd/Qwen2.5-Coder-14B-Instruct_gpuep_1.0_gpu_128/tree/df388f560940da634097518f1da337b36a977b3a",
                 "modified_at": "2026-10-11T00:00:00Z",
-                "size": 8853580693,
+                "size": 8853576872,
                 "flm_min_version": "0.9.24",
                 "default_context_length": 32768,
                 "max_prefill_len": 4096,
@@ -16,7 +16,8 @@
                     "hip_only": true,
                     "provider": "AMDGPU",
                     "profile": "hip",
-                    "support_status": "strict_gpu",
+                    "support_status": "unqualified",
+                    "unsupported_reason": "The pinned public graph fails with a HIP input-rank mismatch on the retained OGA runtime; removing unused inputs_embeds is verified only as a separate derived graph, not as this public package",
                     "config_path": "hip-qwen2.5-coder-14b-oga",
                     "required_files": [
                         "genai_config.json",
@@ -37,7 +38,7 @@
                     "public_hf": {
                         "endpoint_env": "FLM_HIP_OGA_HF_ENDPOINT",
                         "repo_id": "amd/Qwen2.5-Coder-14B-Instruct_gpuep_1.0_gpu_128",
-                        "revision": "6de529bb30355eac01ad8daab89cda657ddf0418",
+                        "revision": "df388f560940da634097518f1da337b36a977b3a",
                         "source_subdir": "Upload Qwen2.5 ONNX files",
                         "license": "Apache-2.0",
                         "model_kind": "text",
@@ -45,7 +46,7 @@
                             {"path": "added_tokens.json", "sha256": "f0acedf99e19ec0a5b797ffbd0b94328172ccd90f7f385bbc521cda2701b03ab", "size": 629},
                             {"path": "chat_template.jinja", "sha256": "8aa40ce145adb73cb3a75194dc0224702a95850ec5275cabb728496bbd749fc6", "size": 2561},
                             {"path": "config.json", "sha256": "e6dadfee23cf246388334740217d32d7c9475d0e5c9dac58e72b57d0714e24fa", "size": 1836},
-                            {"path": "genai_config.json", "sha256": "c0f00464a852e588a1edca9f2770e36733d7a20262a4f7abab7dccc1029db380", "size": 1717},
+                            {"path": "genai_config.json", "sha256": "499bf84264edaaa24135bd8fd8fd15bd54478dc14561068986990d826ea4250e", "size": 1879},
                             {"path": "generation_config.json", "sha256": "daeab96960fc7646b5b4f2e9da0a171c4bc2a769592da0aea3f5d8d6e0e07677", "size": 257},
                             {"path": "merges.txt", "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5", "size": 1671853},
                             {"path": "model_config.json", "sha256": "6c99b383462ac6255abbb768a1ebaf17631d8fa47b83e730c1528ae98b41a61d", "size": 6344},
@@ -69,7 +70,7 @@
                     "hip",
                     "text",
                     "tool-calling",
-                    "strict_gpu",
+                    "unqualified",
                     "default"
                 ],
                 "footprint": 8.25
@@ -90,7 +91,8 @@
                     "hip_only": true,
                     "provider": "AMDGPU",
                     "profile": "hip",
-                    "support_status": "strict_gpu",
+                    "support_status": "unqualified",
+                    "unsupported_reason": "This unqualified package shares the public decoder graph with the Qwen Coder input-rank failure; exact-package runtime qualification is required",
                     "config_path": "hip-qwen2.5-14b-oga",
                     "required_files": [
                         "genai_config.json",
@@ -142,7 +144,7 @@
                 "label": [
                     "hip",
                     "text",
-                    "strict_gpu",
+                    "unqualified",
                     "alternate"
                 ],
                 "footprint": 8.25
@@ -152,9 +154,9 @@
             "4b": {
                 "name": "Gemma3-4B-IT-HIP-OGA",
                 "url": "https://huggingface.co/amd/Gemma3-4B-it_gpuep_1.0_gpu_128",
-                "file_url": "https://huggingface.co/api/models/amd/Gemma3-4B-it_gpuep_1.0_gpu_128/tree/72825e7565eaf95a69416a68a2274e367b6d3fcb",
+                "file_url": "https://huggingface.co/api/models/amd/Gemma3-4B-it_gpuep_1.0_gpu_128/tree/67e57aeb12f71ec7ac94068c433d8de075653863",
                 "modified_at": "2026-10-11T00:00:00Z",
-                "size": 4359351642,
+                "size": 4359347995,
                 "flm_min_version": "0.9.24",
                 "default_context_length": 131072,
                 "max_prefill_len": 4096,
@@ -166,7 +168,7 @@
                     "profile": "hip",
                     "support_status": "hybrid_gpu_experimental",
                     "config_path": "hip-gemma3-4b-oga",
-                    "unsupported_reason": "HIP OGA VLM is hybrid_gpu experimental until strict CPU-fallback-off qualification passes",
+                    "unsupported_reason": "The pinned public Gemma3 image requests pass strict GPU execution, but text-only requests fail image_features rank 2 versus 3 on the retained OGA runtime; private flat-feature qualification does not admit this public graph",
                     "required_files": [
                         "genai_config.json",
                         "chat_template.jinja",
@@ -185,7 +187,7 @@
                     "public_hf": {
                         "endpoint_env": "FLM_HIP_OGA_HF_ENDPOINT",
                         "repo_id": "amd/Gemma3-4B-it_gpuep_1.0_gpu_128",
-                        "revision": "72825e7565eaf95a69416a68a2274e367b6d3fcb",
+                        "revision": "67e57aeb12f71ec7ac94068c433d8de075653863",
                         "source_subdir": "Upload gemma3-4b-it ONNX files",
                         "license": "Gemma",
                         "model_kind": "vlm",
@@ -193,7 +195,7 @@
                             {"path": "chat_template.jinja", "sha256": "e0a1e0983c75b0198f1045cbb20c64506a9ffb30925bd44feba0b91acf2d4f43", "size": 1579},
                             {"path": "embedding.onnx", "sha256": "f082b0ede468b6528aa93e4550cad0a958574b4ba015fc5a8ca6a98bb6ccdeff", "size": 4328},
                             {"path": "embedding.onnx.data", "sha256": "1fecd829d21c8cbf2f4022121119625143b3a0fef27d307c3495baf9881a5a0b", "size": 1342504960},
-                            {"path": "genai_config.json", "sha256": "17810695805f464b26a091207071f0eca19061fb8b8eab8531e3e8c26cd9aba7", "size": 2540},
+                            {"path": "genai_config.json", "sha256": "c280f4e1b883ac5f2dd031392af8f05e97cb64e6e8926a517c24b79a8089386d", "size": 3263},
                             {"path": "processor_config.json", "sha256": "262e46e97a0bdfcae65e6d7cc8e61942759d7e453c1dc29875d361aac2283a8d", "size": 1276},
                             {"path": "text.onnx", "sha256": "5e71d480ca975c9af659b5d0f510c42066db2842e4277a9e67d2e969c43582bc", "size": 557551},
                             {"path": "text.onnx.data", "sha256": "887cb518d8a01e3908839657aeedca2229d3babc8dbb35bd98dd52db86e5a238", "size": 2136358912},

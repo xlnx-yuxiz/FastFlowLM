@@ -162,9 +162,8 @@ inline nlohmann::json build_session_overlay(const nlohmann::json& genai_config,
             {"provider_options",
              nlohmann::json::array({nlohmann::json::object({{provider, provider_config}})})}
         };
-        if (policy == kStrictGpuPolicy) {
-            session_options["disable_cpu_ep_fallback"] = "1";
-        }
+        session_options["session.disable_cpu_ep_fallback"] =
+            policy == kStrictGpuPolicy ? "1" : "0";
         if (diagnostics_enabled) {
             session_options["enable_profiling"] = profile_root + "-" + section;
             session_options["log_id"] = "flm-hip-oga-" + section + "-" + policy;
@@ -173,6 +172,22 @@ inline nlohmann::json build_session_overlay(const nlohmann::json& genai_config,
         overlay_model[section] = {{"session_options", std::move(session_options)}};
     }
     return {{"model", std::move(overlay_model)}};
+}
+
+// Apply to JSON before OgaConfig::Create. OGA's post-create Overlay rebuilds
+// optional multimodal session options without repopulating their providers.
+inline nlohmann::json build_effective_config(
+    const nlohmann::json& genai_config,
+    const nlohmann::json& hip_oga_options,
+    bool diagnostics_enabled = false,
+    const std::string& diagnostics_prefix = "") {
+    auto result = genai_config;
+    result.merge_patch(build_session_overlay(genai_config, hip_oga_options,
+                                            diagnostics_enabled, diagnostics_prefix));
+    for (const auto& section : pipeline_sections(result)) {
+        result["model"][section]["session_options"].erase("disable_cpu_ep_fallback");
+    }
+    return result;
 }
 
 }  // namespace flm::hip_oga

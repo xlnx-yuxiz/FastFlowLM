@@ -9,29 +9,28 @@
 
 GPT_OSS::GPT_OSS(flm_rt::device* npu_device_inst) : AutoModel(npu_device_inst, "gpt-oss") {}
 
-void GPT_OSS::load_model(std::string model_path, json model_info, int default_context_length, bool enable_preemption) {
-    this->model_path = model_path;
-    this->_shared_load_model(model_path, model_info, default_context_length, enable_preemption);
-    this->q4nx = std::make_unique<Q4NX>(this->model_path);
-    this->lm_engine = std::make_unique<gpt_oss_npu>(*this->lm_config, this->npu.get(), this->MAX_L);
-    this->lm_engine->load_weights(*this->q4nx);
-    this->q4nx.reset();
-    this->tokenizer = std::make_unique<Tokenizer>(model_path);
+void GPT_OSS::load_model(std::string model_path, json model_info, int default_context_length, bool enable_preemption, const std::string& backend) {
+    this->_shared_load_backend(model_path, model_info, default_context_length, enable_preemption, backend);
+    try {
+        this->setup_tokenizer(model_path);
+        this->sampler.reset();
 
-    this->setup_tokenizer(model_path);
-    this->sampler.reset();
+        sampler_config config;
+        config.top_k = 10;
+        config.top_p = 0.95;
+        config.min_p = 0.1;
+        config.temperature = 0.6;
+        config.rep_penalty = 1.05;
+        config.freq_penalty = 1.05;
 
-    sampler_config config;
-    config.top_k = 10;
-    config.top_p = 0.95;
-    config.min_p = 0.1;
-    config.temperature = 0.6;
-    config.rep_penalty = 1.05;
-    config.freq_penalty = 1.05;
-
-    this->set_sampler(config);
-    for (size_t i = 0; i < PROFILER_TYPE_NUM; i++) {
-        this->profiler_list[i].reset();
+        this->set_sampler(config);
+        for (size_t i = 0; i < PROFILER_TYPE_NUM; i++) {
+            this->profiler_list[i].reset();
+        }
+        this->is_model_loaded = true;
+    } catch (...) {
+        this->_release_model_state();
+        throw;
     }
 }
 
@@ -80,7 +79,7 @@ bool GPT_OSS::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, std
     
     // hardware
     int restore_idx = -1;
-    gpt_oss_npu *gpt_oss_engine = dynamic_cast<gpt_oss_npu*>(this->lm_engine.get());
+    gpt_oss_npu *gpt_oss_engine = dynamic_cast<gpt_oss_npu*>(this->lm_engine);
     if (meta_info.restore_allowed) {
         restore_idx = gpt_oss_engine->restore();
         this->total_tokens = restore_idx;

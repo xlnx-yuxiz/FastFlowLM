@@ -21,6 +21,7 @@ struct program_args_t {
     int ctx_length = -1; // let model decide
     std::string backend = ""; // empty/npu = FastFlowLM NPU path; hip = OGA over HIP EP
     std::string hip_oga_text_codec;
+    std::string sampler = "backend";
     std::string hip_oga_tokenizer;
     std::string hip_oga_decoder;
     int prefill_chunk_len = -1; // let model decide
@@ -28,6 +29,11 @@ struct program_args_t {
     // handling input file
     std::string input_file_name = "";
     int max_tokens = -1;
+    std::string tools_file;
+    std::string tools_choice = "required";
+    std::string tool_executor;
+    std::string tool_data_dir;
+    int max_tool_turns = 8;
     int iterations = 2;
 
     // specific commands

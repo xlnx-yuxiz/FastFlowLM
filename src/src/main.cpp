@@ -732,8 +732,12 @@ int main(int argc, char* argv[]) {
             }
         }
         else if (parsed_args.command == "remove") {
-            // Remove the model, this will be used to remove the model
-            downloader.remove_model(parsed_args.model_tag);
+            if (using_hip_oga) {
+                flm::hip_oga::PublicHfDownloader hip_downloader(availble_models);
+                if (!hip_downloader.remove(parsed_args.model_tag)) return 1;
+            } else {
+                if (!downloader.remove_model(parsed_args.model_tag)) return 1;
+            }
         }
         else if (parsed_args.command == "check") {
             if (using_hip_oga) {
@@ -747,6 +751,10 @@ int main(int argc, char* argv[]) {
                         availble_models.get_model_info(parsed_args.model_tag);
                     report_hip_oga_offload_policy(selected_model_info);
                     std::string model_path = availble_models.get_hip_oga_model_path(new_tag);
+                    if (availble_models.has_hip_oga_public_hf(new_tag)) {
+                        flm::hip_oga::PublicHfDownloader hip_downloader(availble_models);
+                        if (!hip_downloader.check(new_tag)) return 1;
+                    }
                     header_print("FLM", "HIP OGA model tag '" << new_tag <<
                         "' resolves to ready package: " << model_path);
                 }

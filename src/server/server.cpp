@@ -9,6 +9,7 @@
 #include "server.hpp"
 #include "backend_options.hpp"
 #include "rest_handler.hpp"
+#include "request_scope.hpp"
 #include <sstream>
 #include <thread>
 #include <iostream>
@@ -157,6 +158,12 @@ int NPUAccessManager::get_active_npu_requests() {
     return g_npu_active_requests.load();
 }
 
+// All routes that share RestHandler's text engine must use this admission gate.
+static bool is_text_generation_path(const std::string& path) {
+    return path == "/api/generate" || path == "/api/chat" ||
+           path == "/v1/chat/completions" || path == "/v1/completions";
+}
+
 // Helper function to check if an endpoint requires NPU access
 bool requires_npu_access(const std::string& method,
                          const std::string& path,
@@ -164,11 +171,7 @@ bool requires_npu_access(const std::string& method,
                          const std::string& default_backend) {
     if (method != "POST") return false;
 
-    const bool text_generation_path =
-        path == "/api/generate" ||
-        path == "/api/chat" ||
-        path == "/v1/chat/completions";
-    if (text_generation_path) {
+    if (is_text_generation_path(path)) {
         std::string requested_backend = default_backend;
         if (request.is_object() && request.contains("backend") &&
             request["backend"].is_string()) {
@@ -182,7 +185,8 @@ bool requires_npu_access(const std::string& method,
         }
     }
 
-    return path == "/v1/audio/transcriptions" || path == "/v1/embeddings";
+    return path == "/v1/audio/transcriptions" || path == "/v1/embeddings" ||
+           path == "/api/embeddings";
 }
 
 ///@brief HttpSession class implementation
@@ -545,9 +549,9 @@ void WebServer::stop() {
 ///@brief register active request
 ///@param request_id the request ID
 ///@param token the cancellation token
-void WebServer::register_active_request(const std::string& request_id, std::shared_ptr<CancellationToken> token) {
+bool WebServer::register_active_request(const std::string& request_id, std::shared_ptr<CancellationToken> token) {
     std::lock_guard<std::mutex> lock(active_requests_mutex_);
-    active_requests_[request_id] = token;
+    return active_requests_.emplace(request_id, std::move(token)).second;
 }
 
 ///@brief unregister active request
@@ -563,9 +567,8 @@ void WebServer::unregister_active_request(const std::string& request_id) {
 bool WebServer::cancel_request(const std::string& request_id) {
     std::lock_guard<std::mutex> lock(active_requests_mutex_);
     auto it = active_requests_.find(request_id);
-    if (it != active_requests_.end()) {
+    if (it != active_requests_.end() && !it->second->completed()) {
         it->second->cancel();
-        active_requests_.erase(it);
         return true;
     }
     return false;
@@ -664,9 +667,11 @@ bool WebServer::handle_request(http::request<http::string_body>& req,
             std::string content_type = std::string(req[http::field::content_type]);
 
             if (content_type.find("application/json") != std::string::npos) {
+                // Classify by media type even if the logging parse fails.
+                // The request boundary below must still return HTTP 400.
+                is_json = true;
                 request_json_log = json::parse(req.body());
                 brief_print_message_request(request_json_log);
-                is_json = true;
             }
             else if (content_type.find("multipart/form-data") != std::string::npos) {
                 // print some request info 
@@ -699,138 +704,99 @@ bool WebServer::handle_request(http::request<http::string_body>& req,
     auto* req_ptr = &req;
     auto* res_ptr = &res;
 
-    // Define a task lambda with is_deferred flag
-    auto process_task = [this, it, req_ptr, res_ptr, session, needs_npu, key, is_json](bool is_deferred) {
+    // Admission and cancellation ownership outlive every response callback: a
+    // handler may still clear the context or destroy its streaming parser after
+    // sending the final response. Never admit the next engine user before that.
+    const std::string path(req.target());
+    const bool text_request = req.method() == http::verb::post && is_text_generation_path(path);
+    const bool needs_engine = text_request || (req.method() == http::verb::get && path == "/api/ps");
+    // ASR/embedding handlers do not consume CancellationToken.
+    const bool track_request = text_request;
+    auto process_task = [this, it, req_ptr, res_ptr, session, needs_npu, needs_engine, track_request, is_json](bool is_deferred) {
         auto& req_ref = *req_ptr;
         auto& res_ref = *res_ptr;
-
-        // Parse JSON request body
-        json request_json;
-        try {
-            if (!req_ref.body().empty()) {
-                if(is_json)
-                    request_json = json::parse(req_ref.body());
-                //else 
-                    //do some parse to the MultiPart request?
-                    //std::map<std::string, MultipartPart> parts = parse_multipart(req_ref);
-            }
-        }
-        catch (const std::exception& e) {
-            res_ref.result(http::status::bad_request);
-            res_ref.body() = json{ {"error", "Invalid JSON"} }.dump();
-            res_ref.set(http::field::content_type, "application/json");
-            res_ref.prepare_payload();
-
-            // Only write from callback when deferred
-            if (is_deferred && session) session->write_response_from_callback();
-
-            if (needs_npu) {
-                this->process_next_npu_request();
-            }
-            return;
-        }
-
         auto cancellation_token = std::make_shared<CancellationToken>(session);
-        session->set_cancellation_token(cancellation_token);
-
         std::string request_id;
-        if (request_json.contains("request_id")) {
-            request_id = request_json["request_id"];
-        }
-        else {
-            static std::atomic<int> counter{ 0 };
-            request_id = "req_" + std::to_string(counter.fetch_add(1));
-        }
-
-        register_active_request(request_id, cancellation_token);
-
-        // catch is_deferred 
-        auto send_response = [res_ptr, session, this, request_id, needs_npu, is_deferred, cancellation_token](const json& response_data) {
-            auto& response_ref = *res_ptr;
-            http::status status = http::status::ok;
-
-            if (response_data.contains("error") &&
-                response_data["error"].contains("code"))
-            {
-                int code = response_data["error"]["code"].get<int>();
-
-                if (code == 400) {
-                    status = http::status::bad_request;
+        bool registered = false;
+        std::unique_lock<std::mutex> engine_lock(engine_request_mutex_, std::defer_lock);
+        flm::server::RequestScope finish_request([&] {
+            cancellation_token->complete();
+            if (registered) unregister_active_request(request_id);
+            if (engine_lock.owns_lock()) engine_lock.unlock();
+            if (needs_npu) {
+                try {
+                    process_next_npu_request();
+                } catch (...) {
+                    // A failed queue dispatch must not retain hardware ownership.
+                    NPUAccessManager::release_npu_access();
+                    throw; // RequestScope reports cleanup failure without terminating.
                 }
-                //else if () {
-
-                //}
             }
+        });
 
-            response_ref.result(status);
+        auto send_response = [res_ptr, session, is_deferred, cancellation_token](const json& response_data) {
+            auto& response_ref = *res_ptr;
+            unsigned int code = 200;
+            if (response_data.contains("error") && response_data["error"].is_object()) {
+                const auto& error = response_data["error"];
+                if (error.contains("code") && error["code"].is_number_integer()) {
+                    const int requested_code = error["code"].get<int>();
+                    if (requested_code >= 400 && requested_code <= 599) code = requested_code;
+                }
+            }
+            response_ref.result(code);
             response_ref.body() = response_data.dump();
             response_ref.set(http::field::content_type, "application/json");
+            if (code == 503) response_ref.set(http::field::retry_after, "1");
             response_ref.prepare_payload();
             cancellation_token->complete();
-            unregister_active_request(request_id);
-
-            if (needs_npu) {
-                this->process_next_npu_request();
-            }
-
-            if (is_deferred && session) {
-                session->write_response_from_callback();
-            }
+            if (is_deferred && session) session->write_response_from_callback();
         };
-
-        auto send_streaming_response = [session, this, request_id, needs_npu, cancellation_token](const json& data, bool is_final) {
-            if (is_final) {
-                cancellation_token->complete();
-            }
-
-            if (session) {
-                session->write_streaming_response(data, is_final);
-            }
-            if (is_final) {
-                unregister_active_request(request_id);
-
-                if (needs_npu) {
-                    this->process_next_npu_request();
-                }
-            }
+        auto send_error = [&send_response](int code, const std::string& type, const std::string& message) {
+            send_response(json{{"error", {{"message", message}, {"type", type}, {"code", code}}}});
+        };
+        auto send_streaming_response = [session, cancellation_token](const json& data, bool is_final) {
+            if (is_final) cancellation_token->complete();
+            if (session) session->write_streaming_response(data, is_final);
         };
 
         try {
+            json request_json;
+            try {
+                if (!req_ref.body().empty() && is_json) request_json = json::parse(req_ref.body());
+            } catch (const std::exception&) {
+                send_error(400, "invalid_request_error", "Invalid JSON");
+                return;
+            }
+            // Control requests (especially /api/cancel) never register their
+            // target ID. Live IDs cannot replace or unregister another owner.
+            if (track_request) {
+                if (request_json.contains("request_id")) {
+                    if (!request_json["request_id"].is_string() || request_json["request_id"].get<std::string>().empty()) {
+                        send_error(400, "invalid_request_error", "request_id must be a nonempty string");
+                        return;
+                    }
+                    request_id = request_json["request_id"].get<std::string>();
+                } else {
+                    static std::atomic<unsigned long long> counter{0};
+                    request_id = "req_" + std::to_string(counter.fetch_add(1));
+                }
+                registered = register_active_request(request_id, cancellation_token);
+                if (!registered) {
+                    send_error(409, "duplicate_request_id", "request_id is already active");
+                    return;
+                }
+            }
+            if (needs_engine && !engine_lock.try_lock()) {
+                send_error(503, "engine_busy", "The shared text engine is busy; retry after the active request finishes");
+                return;
+            }
+            if (track_request && session) session->set_cancellation_token(cancellation_token);
             it->second(req_ref, send_response, send_streaming_response, session, cancellation_token);
-        }
-        catch (const std::exception& e) {
-            cancellation_token->complete();
-            unregister_active_request(request_id);
-
-            res_ref.result(http::status::internal_server_error);
-            res_ref.body() = json{ {"error", std::string("Handler exception: ") + e.what()} }.dump();
-            res_ref.set(http::field::content_type, "application/json");
-            res_ref.prepare_payload();
-
-            if (needs_npu) {
-                this->process_next_npu_request();
-            }
-
-            if (is_deferred && session) {
-                session->write_response_from_callback();
-            }
-        }
-        catch (...) {
-            cancellation_token->complete();
-            unregister_active_request(request_id);
-
-            res_ref.result(http::status::internal_server_error);
-            res_ref.body() = json{ {"error", "Unknown handler exception"} }.dump();
-            res_ref.set(http::field::content_type, "application/json");
-            res_ref.prepare_payload();
-
-            if (needs_npu) {
-                this->process_next_npu_request();
-            }
-
-            if (is_deferred && session) {
-                session->write_response_from_callback();
-            }
+        } catch (const std::exception& e) {
+            send_error(500, "server_error", std::string("Handler exception: ") + e.what());
+        } catch (...) {
+            send_error(500, "server_error", "Unknown handler exception");
         }
     }; // --- End of process_task lambda ---
 

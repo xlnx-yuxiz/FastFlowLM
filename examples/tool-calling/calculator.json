@@ -1,0 +1,25 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "add_numbers",
+      "description": "Compute the exact sum of two integers.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "integer"
+          },
+          "b": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "a",
+          "b"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+]

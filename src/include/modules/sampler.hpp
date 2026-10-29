@@ -7,6 +7,7 @@
 #pragma once
 
 #include "typedef.hpp"
+#include "sampling/cpu_sampler.hpp"
 #include <cstdint>
 #include <deque>
 #include <random>
@@ -80,6 +81,13 @@ public:
     Sampler(int in_features, sampler_config& config);
     void set_seed(uint64_t seed);
 
+    // The owner keeps this vector alive and updates it after each committed
+    // token/rewind. Common sampling never writes to the legacy penalty ring.
+    void configure_common(const flm::sampling::LogitsOptions& options,
+                          const std::vector<int>* logical_history, uint64_t seed);
+    void disable_common() { common_history_ = nullptr; }
+    void reset_common_seed(uint64_t seed) { common_sampler_.reset(seed); }
+
     /// \brief Reset the penalties
     /// \note The function will reset the penalties
     /// \note The function will reset the token positions
@@ -116,4 +124,9 @@ public:
     /// \param x the input buffer
     /// \return the sampled token
     int sample(buffer<bf16>& x);
+
+private:
+    const std::vector<int>* common_history_ = nullptr;
+    flm::sampling::LogitsOptions common_options_;
+    flm::sampling::CpuSampler common_sampler_;
 };

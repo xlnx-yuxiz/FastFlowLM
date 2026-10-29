@@ -8,13 +8,18 @@
 */
 #include "runner.hpp"
 #include "backend_options.hpp"
+#include "chat/chat_constraint.hpp"
+#include "chat/auto_tools.hpp"
+#include "chat/chat_output.hpp"
 #include "harmony_filter.hpp"
 #include "hip_oga_policy.hpp"
+#include "AutoModel/hip_oga_sampling.hpp"
 #ifndef FASTFLOWLM_LINUX_LIMITED_MODELS
 #include "AutoEmbeddingModel/all_embedding_model.hpp"
 #endif
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <filesystem>
 #include <map>
 #include <iomanip>
@@ -62,11 +67,19 @@ Runner::Runner(model_list& supported_models, ModelDownloader& downloader, progra
     : supported_models(supported_models), downloader(downloader), tag(args.model_tag),
       initial_prompt(args.input_file_name), modelscope(args.modelscope), asr(args.asr), embed(args.embed),
       img_pre_resize(args.img_pre_resize), preemption(args.preemption),
-      backend(flm::backend::normalize_backend(args.backend)) {
+      backend(flm::backend::normalize_backend(args.backend)), sampler_provider(args.sampler) {
 
     if (flm::backend::is_hip_oga_backend(this->backend) && (this->asr || this->embed)) {
         throw std::runtime_error(
             "ASR and embedding models remain NPU-only; do not combine them with --backend hip");
+    }
+
+    if (!args.tools_file.empty()) {
+        if (!flm::backend::is_hip_oga_backend(this->backend) || this->asr || this->embed)
+            throw std::invalid_argument("--tools currently requires a text model with --backend hip");
+        this->tool_session = std::make_unique<flm::chat::cli_tools_session>(
+            std::filesystem::u8path(args.tools_file), args.tool_executor,
+            std::filesystem::u8path(args.tool_data_dir), args.max_tool_turns, args.tools_choice);
     }
 
     if (args.ctx_length != -1) {
@@ -125,7 +138,8 @@ Runner::Runner(model_list& supported_models, ModelDownloader& downloader, progra
         report_hip_oga_offload_policy(model_info);
     }
     try {
-        this->auto_chat_engine->load_model(model_path, model_info, this->ctx_length, this->preemption);
+        this->auto_chat_engine->load_model(model_path, model_info, this->ctx_length, this->preemption, this->backend);
+        this->auto_chat_engine->set_sampling_provider(this->sampler_provider);
     }
     catch (const std::exception& e) {
         header_print("ERROR", "Failed to load model: " + std::string(e.what()));
@@ -144,7 +158,11 @@ Runner::Runner(model_list& supported_models, ModelDownloader& downloader, progra
         this->prefill_chunk_len = 4096; // default value
     }
 
-    this->generate_limit = args.max_tokens;
+    this->generate_limit = (this->tool_session && args.max_tokens == -1) ? 256 : args.max_tokens;
+    if (this->tool_session) {
+        this->auto_chat_engine->set_log_raw_output(false);
+        this->auto_chat_engine->set_temperature(0.0f);
+    }
 
 
     if (this->embed) {
@@ -204,7 +222,50 @@ flm_rt::device* Runner::ensure_npu_device() {
     return this->npu_device_inst.get();
 }
 
+bool Runner::generate_tools(const std::string& input, std::ostream& output) {
+    try {
+        this->tool_session->run(input, [&](const json& messages, const json& tools) {
+            this->auto_chat_engine->clear_context();
+            const bool automatic = this->tool_session->automatic();
+            const json request = {{"tool_choice", automatic ? "auto" : "required"}, {"parallel_tool_calls", false},
+                                  {"tool_routing", automatic ? "structured" : "template"}};
+            chat_constraint_request constraint_request;
+            std::string error;
+            if (!chat_constraint_request_from_openai(request, tools, constraint_request, error))
+                throw std::invalid_argument(error);
+            chat_meta_info_t meta;
+            meta.max_prefill_len = this->prefill_chunk_len;
+            meta.constraint = this->auto_chat_engine->make_constraint(constraint_request);
+            if (!meta.constraint) throw std::invalid_argument("Model cannot enforce tool calls");
+            lm_uniform_input_t request_input;
+            request_input.messages = automatic ? chat_prepare_auto_tools(messages, tools) : messages;
+            request_input.tools = automatic ? json::array() : tools;
+            (void)this->auto_chat_engine->configure_parameter("hip_oga_requested_max_tokens", this->generate_limit);
+            this->auto_chat_engine->start_total_timer();
+            this->auto_chat_engine->start_ttft_timer();
+            if (!this->auto_chat_engine->insert(meta, request_input))
+                throw std::runtime_error("Tool prompt exceeds model context");
+            this->auto_chat_engine->stop_ttft_timer();
+            std::ostringstream hidden;
+            const auto raw = this->auto_chat_engine->generate(meta, this->generate_limit, hidden);
+            this->auto_chat_engine->stop_total_timer();
+            const auto& format = this->auto_chat_engine->get_chat_format();
+            chat_output parser(format, chat_format_prefill(format, meta.prompt_tail), tools, true, true, false, automatic);
+            const auto parsed = parser.update(raw, true);
+            if (!parsed.error.empty()) throw std::runtime_error(parsed.error);
+            return parsed.message;
+        }, output);
+        this->auto_chat_engine->clear_context();
+        return true;
+    } catch (const std::exception& error) {
+        this->auto_chat_engine->clear_context();
+        header_print("ERROR", "Tool request failed: " << error.what());
+        return false;
+    }
+}
+
 bool Runner::generate_once(const std::string& input, std::ostream& base_ostream) {
+    if (this->tool_session) return this->generate_tools(input, base_ostream);
     chat_meta_info_t meta_info;
     lm_uniform_input_t uniformed_input;
     meta_info.max_prefill_len = this->prefill_chunk_len;
@@ -257,7 +318,9 @@ void Runner::run() {
     this->auto_chat_engine->configure_parameter("system_prompt", this->system_prompt);
     if (!this->initial_prompt.empty()) {
         if (!this->generate_once(this->initial_prompt, std::cout)) {
-            exit(EXIT_FAILURE);
+            // Let main report a failure after the model and its temporary
+            // linked configuration view have been destroyed.
+            throw std::runtime_error("One-shot generation failed");
         }
         return;
     }
@@ -326,7 +389,11 @@ void Runner::run() {
                 this->cmd_show(input_list);
             }
             else if (first_token == "/set") {
-                this->cmd_set(input_list);
+                try {
+                    this->cmd_set(input_list);
+                } catch (const std::exception& e) {
+                    header_print("ERROR", "Setting rejected: " + std::string(e.what()));
+                }
             }
             else if (first_token == "/list") {
                 std::cout << "Models:" << std::endl;
@@ -466,6 +533,15 @@ void Runner::run() {
                 }
             }
 
+            if (this->tool_session) {
+                if (!uniformed_input.images.empty() || !uniformed_input.audios.empty()) {
+                    header_print("ERROR", "Native CLI tools currently accept text input only");
+                    continue;
+                }
+                (void)this->generate_tools(input, std::cout);
+                continue;
+            }
+
             chat_meta_info_t meta_info;
             meta_info.max_prefill_len = this->prefill_chunk_len;
             uniformed_input.prompt = input;
@@ -593,7 +669,8 @@ void Runner::cmd_load(std::vector<std::string>& input_list) {
             report_hip_oga_offload_policy(model_info);
         }
         try {
-            this->auto_chat_engine->load_model(model_path, model_info, this->ctx_length, this->preemption);
+            this->auto_chat_engine->load_model(model_path, model_info, this->ctx_length, this->preemption, this->backend);
+            this->auto_chat_engine->set_sampling_provider(this->sampler_provider);
         }
         catch (const std::exception& e) {
             header_print("ERROR", "Failed to load model: " + std::string(e.what()));
@@ -601,6 +678,10 @@ void Runner::cmd_load(std::vector<std::string>& input_list) {
         }
 
         this->auto_chat_engine->configure_parameter("system_prompt", this->system_prompt);
+        if (this->tool_session) {
+            this->auto_chat_engine->set_log_raw_output(false);
+            this->auto_chat_engine->set_temperature(0.0f);
+        }
 
     }
     else
@@ -690,6 +771,8 @@ void Runner::cmd_set(std::vector<std::string>& input_list) {
         std::cout << "  /set rep-pen [value] - set the repetition penalty" << std::endl;
         std::cout << "  /set freq-pen [value] - set the frequency penalty" << std::endl;
         std::cout << "  /set pres-pen [value] - set the presence penalty" << std::endl;
+        std::cout << "  /set sampler [backend|common] - select the sampling provider" << std::endl;
+        std::cout << "  /set seed [value] - set request random seed (-1 for random)" << std::endl;
         std::cout << "  /set sys-msg [value] - set the system message" << std::endl;
         std::cout << "  /set ctx-len [value] - set the max context length" << std::endl;
         std::cout << "  /set gen-lim [value] - Limit tokens generated per round" << std::endl;
@@ -721,25 +804,32 @@ void Runner::cmd_set(std::vector<std::string>& input_list) {
     std::string set_value = input_list[2];
 
     if (set_context == "topk"){
-        this->auto_chat_engine->set_topk(std::stoi(set_value));
+        this->auto_chat_engine->set_topk(flm::hip_oga::parse_sampling_integer(set_value, "top_k", 0));
     }
     else if (set_context == "topp"){
-        this->auto_chat_engine->set_topp(std::stof(set_value));
+        this->auto_chat_engine->set_topp(flm::hip_oga::parse_sampling_float(set_value, "top_p"));
     }
     else if (set_context == "minp") {
-        this->auto_chat_engine->set_minp(std::stof(set_value));
+        this->auto_chat_engine->set_minp(flm::hip_oga::parse_sampling_float(set_value, "min_p"));
     }
     else if (set_context == "temp"){
-        this->auto_chat_engine->set_temperature(std::stof(set_value));
+        this->auto_chat_engine->set_temperature(flm::hip_oga::parse_sampling_float(set_value, "temperature"));
     }
     else if (set_context == "rep-pen"){
-        this->auto_chat_engine->set_repetition_penalty(std::stof(set_value));
+        this->auto_chat_engine->set_repetition_penalty(flm::hip_oga::parse_sampling_float(set_value, "repetition_penalty"));
     }
     else if (set_context == "freq-pen"){
-        this->auto_chat_engine->set_frequency_penalty(std::stof(set_value));
+        this->auto_chat_engine->set_frequency_penalty(flm::hip_oga::parse_sampling_float(set_value, "frequency_penalty"));
     }
     else if (set_context == "pres-pen") {
-        this->auto_chat_engine->set_presence_penalty(std::stof(set_value));
+        this->auto_chat_engine->set_presence_penalty(flm::hip_oga::parse_sampling_float(set_value, "presence_penalty"));
+    }
+    else if (set_context == "seed") {
+        const nlohmann::json update = {{"seed", flm::hip_oga::parse_sampling_seed(set_value)}};
+        this->auto_chat_engine->configure_sampling_request(update, false);
+    }
+    else if (set_context == "sampler") {
+        this->auto_chat_engine->configure_sampling_request({{"sampler", set_value}}, false);
     }
     else if (set_context == "ctx-len"){
         try {
@@ -773,6 +863,8 @@ void Runner::cmd_set(std::vector<std::string>& input_list) {
         std::cout << "  /set rep-pen [value] - set the repetition penalty" << std::endl;
         std::cout << "  /set freq-pen [value] - set the frequency penalty" << std::endl;
         std::cout << "  /set pres-pen [value] - set the presence penalty" << std::endl;
+        std::cout << "  /set sampler [backend|common] - select the sampling provider" << std::endl;
+        std::cout << "  /set seed [value] - set request random seed (-1 for random)" << std::endl;
         std::cout << "  /set sys-msg [value] - set the system message" << std::endl;
         std::cout << "  /set gen-lim [value] - Limit tokens generated per round" << std::endl;
         std::cout << "  /set r-eff [low|medium|high] - set the reasoning effort level (GPT-OSS only, default = medium)" << std::endl;

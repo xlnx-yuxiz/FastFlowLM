@@ -243,7 +243,7 @@ int main(int argc, char** argv) {
         for (const std::string section : {"decoder", "embedding", "vision", "speech"}) {
             const auto& session_options =
                 strict_overlay["model"][section]["session_options"];
-            if (session_options["disable_cpu_ep_fallback"] != true) {
+            if (session_options["session.disable_cpu_ep_fallback"] != "1") {
                 throw std::runtime_error("strict_gpu overlay must disable CPU EP fallback for " + section);
             }
             if (session_options["provider_options"][0]["AMDGPU"]["profile"] != "hip") {
@@ -259,9 +259,9 @@ int main(int argc, char** argv) {
                                {"offload_policy", "hybrid_gpu"}},
                 true,
                 "flm-hip-oga-profile");
-        if (hybrid_overlay["model"]["vision"]["session_options"].contains(
-                "disable_cpu_ep_fallback")) {
-            throw std::runtime_error("hybrid_gpu overlay must not disable CPU EP fallback");
+        if (hybrid_overlay["model"]["vision"]["session_options"][
+                "session.disable_cpu_ep_fallback"] != "0") {
+            throw std::runtime_error("hybrid_gpu overlay must explicitly enable CPU EP fallback");
         }
         if (hybrid_overlay["model"]["vision"]["session_options"]["enable_profiling"] !=
             "flm-hip-oga-profile-vision") {

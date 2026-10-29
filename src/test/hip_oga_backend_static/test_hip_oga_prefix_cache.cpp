@@ -116,7 +116,7 @@ void test_divergent_prefix_resets_to_fresh_prompt() {
             "divergent prompt must drop the stale checkpoint");
 }
 
-void test_fully_cached_prompt_has_empty_suffix() {
+void test_fully_cached_prompt_uses_fresh_prefill() {
     PrefixCacheState state;
     state.commit_checkpoint({41, 42, 43}, "model=A;ctx=512;max=8", 512);
 
@@ -129,7 +129,15 @@ void test_fully_cached_prompt_has_empty_suffix() {
                                           512,
                                           {41, 42, 43});
 
-    require_hit(decision, 3, 0);
+    require_fresh(decision, "empty_suffix", 3);
+    require(decision.attempted, "identical prompt should record attempted reuse");
+    require(!state.has_checkpoint(), "identical prompt must rebuild checkpoint");
+    require(!state.disabled_for_session(), "empty suffix must not disable the session");
+
+    state.commit_checkpoint({41, 42, 43}, "model=A;ctx=512;max=8", 512);
+    const auto extension = decide(state, true, true, true,
+        "model=A;ctx=512;max=8", 128, 512, {41, 42, 43, 44});
+    require_hit(extension, 3, 1);
 }
 
 void test_signature_and_capacity_invalidate() {
@@ -227,7 +235,7 @@ int main() {
     test_enabled_same_prefix_hit();
     test_disabled_misses_even_when_prompt_cache_hit();
     test_divergent_prefix_resets_to_fresh_prompt();
-    test_fully_cached_prompt_has_empty_suffix();
+    test_fully_cached_prompt_uses_fresh_prefill();
     test_signature_and_capacity_invalidate();
     test_provider_exception_disables_reuse_for_session();
     test_vlm_request_forces_miss_and_clears_checkpoint();

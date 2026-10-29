@@ -10,31 +10,27 @@
 /************              Nanbeige family            **************/
 Nanbeige::Nanbeige(flm_rt::device* npu_device_inst) : AutoModel(npu_device_inst, "Nanbeige") {}
 
-void Nanbeige::load_model(std::string model_path, json model_info, int default_context_length, bool enable_preemption) {
-    this->_shared_load_model(model_path, model_info, default_context_length, enable_preemption);
-    
-    this->q4nx = std::make_unique<Q4NX>(this->model_path);
-    // model_type == nanbeige
-    this->lm_engine = std::make_unique<nanbeige_npu>(*this->lm_config, this->npu.get(), this->MAX_L);
+void Nanbeige::load_model(std::string model_path, json model_info, int default_context_length, bool enable_preemption, const std::string& backend) {
+    this->_shared_load_backend(model_path, model_info, default_context_length, enable_preemption, backend);
+    try {
 
-    this->lm_engine->load_weights(*this->q4nx);
+        this->setup_tokenizer(model_path);
+        this->sampler.reset();
 
-    //free the q4nx
-    this->q4nx.reset();
-    
-    this->lm_engine->clear_context();
-    this->setup_tokenizer(model_path);
-    this->sampler.reset();
+        sampler_config config;
+        config.top_k = 20;
+        config.top_p = 0.95;
+        config.min_p = 0.0;
+        config.temperature = 0.6;
 
-    sampler_config config;
-    config.top_k = 20;
-    config.top_p = 0.95;
-    config.min_p = 0.0;
-    config.temperature = 0.6;
-
-    this->set_sampler(config);
-    for (size_t i = 0; i < PROFILER_TYPE_NUM; i++) {
-        this->profiler_list[i].reset();
+        this->set_sampler(config);
+        for (size_t i = 0; i < PROFILER_TYPE_NUM; i++) {
+            this->profiler_list[i].reset();
+        }
+        this->is_model_loaded = true;
+    } catch (...) {
+        this->_release_model_state();
+        throw;
     }
 }
 
@@ -88,7 +84,7 @@ bool Nanbeige::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, st
 
     // hardware
     int restore_idx = -1;
-    nanbeige_npu *nanbeige_engine = dynamic_cast<nanbeige_npu*>(this->lm_engine.get());
+    nanbeige_npu *nanbeige_engine = dynamic_cast<nanbeige_npu*>(this->lm_engine);
 
     if (meta_info.restore_allowed) {
         restore_idx = nanbeige_engine->restore();

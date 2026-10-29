@@ -11,6 +11,10 @@ namespace flm::backend {
 inline constexpr const char* kNpuBackendId = "npu";
 inline constexpr const char* kHipOgaBackendId = "hip";
 
+inline std::string canonical_backend_id(const std::string& backend) {
+    return backend == kNpuBackendId ? "flm" : backend;
+}
+
 inline std::string configured_backend(const std::string& requested) {
     if (!requested.empty()) return requested;
     if (const char* env_backend = std::getenv("FLM_BACKEND");
@@ -21,7 +25,7 @@ inline std::string configured_backend(const std::string& requested) {
 }
 
 inline bool is_default_npu_backend(const std::string& backend) {
-    return backend.empty() || backend == kNpuBackendId;
+    return backend.empty() || backend == kNpuBackendId || backend == "flm";
 }
 
 inline bool is_hip_oga_backend(const std::string& backend) {
@@ -29,8 +33,8 @@ inline bool is_hip_oga_backend(const std::string& backend) {
 }
 
 inline std::string normalize_backend(const std::string& requested) {
-    const std::string backend = configured_backend(requested);
-    if (is_default_npu_backend(backend)) return {};
+    const std::string backend = canonical_backend_id(configured_backend(requested));
+    if (is_default_npu_backend(backend)) return "flm";
 
     if (is_hip_oga_backend(backend)) {
 #if defined(FLM_ENABLE_HIP_OGA)
@@ -42,7 +46,7 @@ inline std::string normalize_backend(const std::string& requested) {
     }
 
     throw std::invalid_argument(
-        "Unknown backend '" + backend + "'. Supported backends: npu, hip");
+        "Unknown backend '" + backend + "'. Supported backends: flm (npu), hip");
 }
 
 }  // namespace flm::backend

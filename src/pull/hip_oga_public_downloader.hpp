@@ -18,6 +18,12 @@ public:
     /// \return true if the package is installed and validates locally
     bool pull(const std::string& model_tag, bool force_redownload = false);
 
+    /// Verify all pinned payload sizes and hashes without modifying the package.
+    bool check(const std::string& model_tag);
+
+    /// Remove only a managed package below the explicit HIP model root.
+    bool remove(const std::string& model_tag);
+
 private:
     model_list& supported_models_;
 };

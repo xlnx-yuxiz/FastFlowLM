@@ -13,34 +13,32 @@
 /************              Qwen3_5VL family            **************/
 Qwen3_5VL::Qwen3_5VL(flm_rt::device* npu_device_inst) : AutoModel(npu_device_inst, "Qwen3_5VL") {}
 
-void Qwen3_5VL::load_model(std::string model_path, json model_info, int default_context_length, bool enable_preemption) {
-    this->_shared_load_model(model_path, model_info, default_context_length, enable_preemption);
-    
-    this->q4nx = std::make_unique<Q4NX>(this->model_path);
-    // lm_config->get<std::string>("model_type", "") == qwen3
-    this->lm_engine = std::make_unique<qwen3_5vl_npu>(*this->lm_config, this->npu.get(), this->MAX_L);
+void Qwen3_5VL::load_model(std::string model_path, json model_info, int default_context_length, bool enable_preemption, const std::string& backend) {
+    this->_shared_load_backend(model_path, model_info, default_context_length, enable_preemption, backend);
+    try {
 
-    this->lm_engine->load_weights(*this->q4nx);
-    //free the q4nx
-    this->q4nx.reset();
-    this->lm_engine->clear_context();
-    this->setup_tokenizer(model_path);
-    this->sampler.reset();
+        this->setup_tokenizer(model_path);
+        this->sampler.reset();
 
-    this->enable_tool = (model_info["size"] > 800000000)? true : false;
+        this->enable_tool = (model_info["size"] > 800000000)? true : false;
 
-    sampler_config config;
-    config.top_k = 20;
-    config.top_p = 0.8;
-    config.min_p = 0.0;
-    config.temperature = 0.7;
-    config.rep_penalty = 1.0;
-    config.freq_penalty = 1.0;
-    config.pre_penalty = 1.5f;
+        sampler_config config;
+        config.top_k = 20;
+        config.top_p = 0.8;
+        config.min_p = 0.0;
+        config.temperature = 0.7;
+        config.rep_penalty = 1.0;
+        config.freq_penalty = 1.0;
+        config.pre_penalty = 1.5f;
 
-    this->set_sampler(config);
-    for (size_t i = 0; i < PROFILER_TYPE_NUM; i++) {
-        this->profiler_list[i].reset();
+        this->set_sampler(config);
+        for (size_t i = 0; i < PROFILER_TYPE_NUM; i++) {
+            this->profiler_list[i].reset();
+        }
+        this->is_model_loaded = true;
+    } catch (...) {
+        this->_release_model_state();
+        throw;
     }
 }
 
@@ -229,7 +227,7 @@ bool Qwen3_5VL::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, s
         if (prefix_skip_count > 0 && !image_payload.images.empty()) {
             // Per-image bf16 footprint depends on runtime patch/temporal
             // config carried by the engine.
-            auto* eng = reinterpret_cast<qwen3_5vl_npu*>(this->lm_engine.get());
+            auto* eng = reinterpret_cast<qwen3_5vl_npu*>(this->lm_engine);
             const unsigned patch_size = eng->QWEN3_5_PATCH_SIZE;
             const unsigned temporal_patch = eng->QWEN3_5_TEMPORAL_PATCH_SIZE;
 
@@ -288,7 +286,7 @@ bool Qwen3_5VL::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, s
 
     // hardware
     int restore_idx = -1;
-    qwen3_5vl_npu *qwen3_5vl_engine = dynamic_cast<qwen3_5vl_npu*>(this->lm_engine.get());
+    qwen3_5vl_npu *qwen3_5vl_engine = dynamic_cast<qwen3_5vl_npu*>(this->lm_engine);
     const bool has_images = image_payload.num_images > 0;
 
     if (meta_info.restore_allowed) {
@@ -446,7 +444,7 @@ std::string Qwen3_5VL::generate_with_prompt(chat_meta_info_t& meta_info, lm_unif
         return "";
     }
     header_print("FLM", "Prompt inserted, starting generation...");
-    qwen3_5vl_npu* qwen35_engine = dynamic_cast<qwen3_5vl_npu*>(this->lm_engine.get());
+    qwen3_5vl_npu* qwen35_engine = dynamic_cast<qwen3_5vl_npu*>(this->lm_engine);
     int checkpoint_idx = qwen35_engine->checkpoint();
     int restore_idx = qwen35_engine->restore();
     header_print_r("FLM", "Checkpoint before generation: " << checkpoint_idx << ", restore point: " << restore_idx << ", user context length: " << this->token_history.size());

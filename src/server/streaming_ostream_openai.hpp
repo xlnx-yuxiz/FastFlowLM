@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <nlohmann/json.hpp>
 #include "AutoModel/automodel.hpp"
+#include "chat/chat_output.hpp"
 #include "harmony_filter.hpp"
 
 using json = nlohmann::ordered_json;
@@ -269,17 +270,27 @@ public:
     streaming_buf_openai_chat(const std::string& model,
                               AutoModel* auto_chat_engine,
                               StreamCallback callback,
-                              bool allow_tool_calls = true)
+                              bool allow_tool_calls = true,
+                              json tools = json::array(),
+                              bool strict_tools = false,
+                              bool json_content = false,
+                              bool structured_auto = false)
         : model_name(model),
           auto_chat_engine(auto_chat_engine),
           stream_callback(callback),
-          first_chunk(true),
-          allow_tool_calls(allow_tool_calls) {
+          allow_tool_calls(allow_tool_calls),
+          tools_(std::move(tools)), strict_tools_(strict_tools), json_content_(json_content),
+          structured_auto_(structured_auto) {
         // Generate a unique ID for this stream
         generate_stream_id();
         generate_created();
         generate_system_fingerprint();
-        harmony_filter_inst = std::make_unique<harmony_filter>();
+    }
+
+    void start(const chat_meta_info_t& meta_info) {
+        const auto& spec = auto_chat_engine->get_chat_format();
+        output_ = std::make_unique<chat_output>(spec, chat_format_prefill(spec, meta_info.prompt_tail),
+                                               tools_, strict_tools_, allow_tool_calls, json_content_, structured_auto_);
     }
 
 protected:
@@ -303,19 +314,15 @@ protected:
 public:
     ///@brief Call this when generation is complete
     void finalize(chat_meta_info_t& meta_info) {
-        // Send all remaining content, including incomplete sequences
-        if (!buffer.empty()) {
+        if (finalized_) return;
+        finalized_ = true;
+        // Cancellation deliberately leaves parser state incomplete. Discard
+        // unsent fragments instead of validating them as a finished model reply.
+        // A protocol error already emitted during generation still wins below.
+        if (meta_info.stop_reason != stop_reason_t::CANCEL_DETECTED) {
             send_response(buffer, false, true);
-            buffer.clear();
         }
-        else {
-            send_response("", false, true);
-        }
-        for (int drain_attempt = 0; drain_attempt < 1024; ++drain_attempt) {
-            if (!send_response("", false, true)) {
-                break;
-            }
-        }
+        buffer.clear();
         // Only promote to a tool-call finish reason on an otherwise clean stop;
         // length/cancel/error must win, so a truncated or aborted generation is
         // never reported to the client as a complete tool call.
@@ -432,97 +439,46 @@ private:
     ///@brief Send the response
     ///@param content the content
     ///@param is_final the is final
-    bool send_response(const std::string& content, bool is_final, bool parser_final = false) {
-        if (stream_stop_reason == stop_reason_t::ERROR_DETECTED) {
-            return false;
+    void send_response(const std::string& content, bool is_final, bool parser_final = false) {
+        if (stream_stop_reason == stop_reason_t::ERROR_DETECTED) return;
+        if (!output_) {
+            chat_meta_info_t empty;
+            start(empty);
         }
-        json response;
-
-        StreamResult result = parser_final
-            ? auto_chat_engine->parse_stream_content_final(content)
-            : auto_chat_engine->parse_stream_content(content);
-        if (result.type == StreamEventType::WAITING) {
-            return false;
-        }
-        json delta;
-        if (result.type == StreamEventType::TOOL_DONE) {
-            if (!allow_tool_calls) {
-                stream_stop_reason = stop_reason_t::ERROR_DETECTED;
-                json error_response = {
-                    {"error", {
-                        {"message", "HIP OGA model emitted a tool call even though no tools were enabled for this request."},
-                        {"type", "model_output_error"},
-                        {"code", 422}
-                    }}
-                };
-                stream_callback("data: " + error_response.dump() + "\n\n", false);
-                return true;
-            }
-            stream_stop_reason = stop_reason_t::TOOL_DETECTED;
-            const int tool_call_index = index++;
-            const std::string tool_call_id = result.tool_id.empty()
-                ? stream_id + "-call-" + std::to_string(tool_call_index)
-                : result.tool_id;
-            delta = {
-                {"tool_calls", json::array({
-                    {
-                        {"index", tool_call_index},
-                        {"id", tool_call_id},
-                        {"type", "function"},
-                        {"function", {
-                            {"name", result.tool_name},
-                            {"arguments", result.tool_args_str}
-                        }}
-                    }
-                })}
-            };
-            header_print("FLM", "Tool name: " + result.tool_name);
-            header_print("FLM", "Tool args: " + result.tool_args_str);
-            header_print("FLM", "Tool JSON: " + delta["tool_calls"][0]["function"].dump());
-        }
-        else if (result.type == StreamEventType::ERROR_EVENT) {
+        auto result = output_->update(content, parser_final);
+        if (!result.error.empty()) {
             stream_stop_reason = stop_reason_t::ERROR_DETECTED;
-            json error_response = {
-                {"error", {
-                    {"message", result.error_message},
-                    {"type", "model_output_error"},
-                    {"code", 422}
-                }}
-            };
+            json error_response = {{"error", {{"message", result.error},
+                {"type", "model_output_error"}, {"code", 422}}}};
             stream_callback("data: " + error_response.dump() + "\n\n", false);
-            return true;
+            return;
         }
-        else if (result.type == StreamEventType::REASONING) {
-            delta = {
-                {"role", "assistant"},
-                {"reasoning_content", result.content}
-            };
-        }
-        else if (result.type == StreamEventType::CONTENT) {
-            if (result.content.empty()) return false;
-
-            delta = {
-                {"role", "assistant"},
-                {"content", result.content}
-            };
-        }
-
-        response = {
-            {"id", stream_id},
-            {"object", "chat.completion.chunk"},
-            {"created", created},
-            {"model", model_name},
-            {"choices", json::array({
-                {
-                    {"index", 0},
-                    {"delta", delta},
-                    {"finish_reason", nullptr}
+        for (const auto& d : result.deltas) {
+            json delta = {{"role", "assistant"}};
+            if (d.is_tool_call()) {
+                stream_stop_reason = stop_reason_t::TOOL_DETECTED;
+                json call = {{"index", d.tool_index}, {"function", {{"arguments", d.tool_arguments}}}};
+                if (!d.tool_id.empty()) {
+                    call["id"] = d.tool_id;
+                    call["type"] = "function";
                 }
-            })}
-        };
-
-        stream_callback("data: " + response.dump() + "\n\n", is_final);
-        return true;
+                if (!d.tool_name.empty()) call["function"]["name"] = d.tool_name;
+                delta["tool_calls"] = json::array({call});
+            } else if (!d.reasoning.empty()) {
+                delta["reasoning_content"] = d.reasoning;
+            } else if (!d.content.empty()) {
+                delta["content"] = d.content;
+            } else {
+                continue;
+            }
+            json response = {
+                {"id", stream_id}, {"object", "chat.completion.chunk"}, {"created", created},
+                {"model", model_name}, {"choices", json::array({{
+                    {"index", 0}, {"delta", delta}, {"finish_reason", nullptr}
+                }})}
+            };
+            stream_callback("data: " + response.dump() + "\n\n", is_final);
+        }
     }
 
     ///@brief Send the chat final response
@@ -577,14 +533,14 @@ private:
     std::string stream_id;
     long created;
     std::string system_fingerprint;
-    ///@brief First chunk flag
-    bool first_chunk;
     stop_reason_t stream_stop_reason = stop_reason_t::EOT_DETECTED;
     bool allow_tool_calls = true;
-    ///@brief tool_calls delta index, scoped to this stream
-    int index = 0;
-
-    std::unique_ptr<harmony_filter> harmony_filter_inst;
+    json tools_;
+    bool strict_tools_;
+    bool json_content_;
+    bool structured_auto_;
+    bool finalized_ = false;
+    std::unique_ptr<chat_output> output_;
 };
 
 ///@brief Custom ostream for streaming
@@ -597,8 +553,15 @@ public:
     streaming_ostream_openai_chat(const std::string& model,
                                   AutoModel* auto_chat_engine,
                                   streaming_buf_openai_chat::StreamCallback callback,
-                                  bool allow_tool_calls = true)
-        : std::ostream(&buf), buf(model, auto_chat_engine, callback, allow_tool_calls) {}
+                                  bool allow_tool_calls = true,
+                                  json tools = json::array(),
+                                  bool strict_tools = false,
+                                  bool json_content = false,
+                                  bool structured_auto = false)
+        : std::ostream(&buf), buf(model, auto_chat_engine, callback, allow_tool_calls,
+                                  std::move(tools), strict_tools, json_content, structured_auto) {}
+
+    void start(const chat_meta_info_t& meta_info) { buf.start(meta_info); }
 
     ///@brief Finalize the chat
     void finalize(chat_meta_info_t& meta_info) {

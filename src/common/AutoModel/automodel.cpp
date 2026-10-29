@@ -119,53 +119,129 @@ nlohmann::json AutoModel::_shared_setup_tokenizer(std::string model_path) {
     }
     this->user_system_prompt = "";
     this->extra_context["user_system_prompt"] = this->user_system_prompt;
+    this->_detect_chat_format(tokenizer_config["chat_template"].get<std::string>());
     return tokenizer_config;
 }
 
+void AutoModel::_detect_chat_format(const std::string& template_src) {
+    this->chat_format = chat_format_detect(template_src, [this](const std::string& text) {
+        auto ids = this->tokenizer->encode(text);
+        if (this->has_bos_token && !ids.empty() && ids.front() == this->bos_token_id) {
+            ids.erase(ids.begin());
+        }
+        return ids.size() == 1;
+    });
+}
 
-void AutoModel::_shared_load_model(std::string model_path, json model_info, int default_context_length, bool enable_preemption) {
-    if (this->is_model_loaded && this->model_path == model_path) {
-        header_print("FLM", "Model already loaded: " << this->model_path);
-        return;
-    }
+AutoModel::~AutoModel() {
+    _release_model_state();
+}
 
-    this->model_path = model_path;
-    header_print("FLM", "Loading model: " << this->model_path);
-    this->lm_config = std::make_unique<LM_Config>();
-    this->lm_config->from_pretrained(this->model_path);
-    if (this->npu_device_inst == nullptr) {
-        header_print("ERROR", "NPU device instance is nullptr");
-        exit(1);
+void AutoModel::_release_model_state() noexcept {
+    // Engines borrow config/NPU resources. Destroy the owner before either
+    // dependency, including during failed replacement and base destruction.
+    lm_engine = nullptr;
+    backend_.reset();
+    q4nx.reset();
+    npu.reset();
+    lm_config.reset();
+    tokenizer.reset();
+    sampler.reset();
+    sampling_state_.reset();
+    chat_tmpl.reset();
+    chat_format = {};
+    is_model_loaded = false;
+    model_path.clear();
+    token_history.clear();
+    checkpoint_his.clear();
+    eos_token_ids.clear();
+    last_token = -1;
+    total_tokens = 0;
+    MAX_L = 0;
+    enable_preemption = false;
+    reset_parser();
+}
+
+std::string AutoModel::backend_family(const json& model_info) const {
+    return model_info.at("details").at("family").get<std::string>();
+}
+
+void AutoModel::_shared_load_backend(std::string model_path, json model_info,
+                                     int default_context_length,
+                                     bool enable_preemption,
+                                     const std::string& requested_backend,
+                                     const nlohmann::json* tokenizer_config) {
+    const std::string family = backend_family(model_info);
+    auto& registry = flm::backend::BackendRegistry::instance();
+    const std::string id = flm::backend::resolve_backend_id(
+        family, flm::backend::kFlmBackendId, requested_backend);
+    // The OGA frontend owns GenerateNextToken and its own multimodal pipeline.
+    // A model-specific NPU frontend must not drive that engine's NPU methods.
+    if (id != flm::backend::kFlmBackendId) {
+        throw std::invalid_argument("Use the HIP OGA frontend for backend '" + id + "'");
     }
-    this->npu = std::make_unique<npu_xclbin_manager>(npu_device::device_npu2, this->npu_device_inst, enable_preemption);
-    this->enable_preemption = enable_preemption;
-    // Single-turn models (e.g. dedicated translation models) don't support arbitrary
-    // context length overrides, so always fall back to the model's own default.
-    bool single_turn = model_info.contains("label") &&
+    const auto traits = registry.traits(family, id);
+    if (enable_preemption && !traits.supports_preemption) {
+        throw std::invalid_argument("Backend '" + id + "' does not support preemption");
+    }
+    const bool catalog_single_turn = model_info.contains("label") &&
         std::find(model_info["label"].begin(), model_info["label"].end(), "single-turn") != model_info["label"].end();
-    // Set context length: use provided value if not -1, otherwise use model default
-    if (default_context_length != -1 && single_turn) {
-        header_print("FLM", "Single-turn model, 1k max context length allowed only!");
-        this->MAX_L = model_info["default_context_length"];
+    const int context_length = default_context_length == -1 || catalog_single_turn
+        ? model_info.at("default_context_length").get<int>() : default_context_length;
+    if (context_length < 1 || (traits.max_context_length &&
+        static_cast<std::uint32_t>(context_length) > traits.max_context_length)) {
+        throw std::out_of_range("Invalid context length for backend '" + id + "'");
     }
-    else if (default_context_length != -1) {
-        this->MAX_L = default_context_length;
+    if (traits.needs_npu_xclbin && !npu_device_inst) {
+        throw std::invalid_argument("FLM backend needs an NPU device instance");
     }
-    else {
-        this->MAX_L = model_info["default_context_length"];
-    }
-    
-    this->is_model_loaded = true;
 
-    this->token_history.clear();
-    this->token_history.reserve(this->MAX_L);
-    this->tokenizer = std::make_unique<Tokenizer>(this->model_path);
-
-    this->last_token = -1;
-    this->total_tokens = 0;
+    _release_model_state();
+    try {
+        this->model_path = std::move(model_path);
+        header_print("FLM", "Loading model: " << this->model_path);
+        lm_config = std::make_unique<LM_Config>();
+        lm_config->from_pretrained(this->model_path);
+        MAX_L = static_cast<std::uint32_t>(context_length);
+        token_history.reserve(MAX_L);
+        tokenizer = std::make_unique<Tokenizer>(this->model_path);
+        if (traits.needs_npu_xclbin) {
+            npu = std::make_unique<npu_xclbin_manager>(
+                npu_device::device_npu2, npu_device_inst, enable_preemption);
+            this->enable_preemption = enable_preemption;
+        }
+        flm::backend::BackendContext context;
+        context.model_path = this->model_path;
+        context.model_info = std::move(model_info);
+        context.config = lm_config.get();
+        context.npu = npu.get();
+        context.device = npu_device_inst;
+        context.context_length = MAX_L;
+        context.enable_preemption = this->enable_preemption;
+        context.tokenizer_config = tokenizer_config;
+        backend_ = registry.create(family, id, context);
+        if (!backend_) throw std::runtime_error("Backend factory returned no engine owner");
+        lm_engine = &backend_->engine();
+        // The frontend marks loaded after tokenizer/sampler setup also succeeds.
+    } catch (...) {
+        _release_model_state();
+        throw;
+    }
 }
 
 bool AutoModel::_shared_insert(chat_meta_info_t& meta_info, std::vector<int>& tokens, std::function<bool()> is_cancelled, void* payload, int first_len_run) {
+    begin_sampling_turn();
+    // Capture before prefix trimming: a cache hit must initialize the same
+    // parser state as a fresh turn. This uses the existing FLM decoder only.
+    meta_info.prompt_tail.clear();
+    constexpr size_t tail_tokens = 32;
+    for (size_t i = tokens.size() > tail_tokens ? tokens.size() - tail_tokens : 0; i < tokens.size(); ++i) {
+        try {
+            meta_info.prompt_tail += this->tokenizer->run_time_decoder(tokens[i]);
+        } catch (const std::runtime_error&) {
+            meta_info.prompt_tail += this->tokenizer->decode({tokens[i]});
+        }
+    }
 
     // print token history
     // header_print("DEBUG", "Current token history: ");
@@ -287,10 +363,10 @@ void AutoModel::_apply_tool_choice_mask(buffer<bf16>& y, const chat_meta_info_t&
     if (tool_start_token_id < 0 || (size_t)tool_start_token_id >= y.size()) {
         return;
     }
-    // A large negative logit rather than -inf: every sampling path either takes
-    // the argmax or runs this through softmax, and a finite value can never turn
-    // into the inf - inf that would poison the whole distribution.
-    y[tool_start_token_id] = bf16(-1e30f);
+    // Preserve the legacy finite mask. Common sampling recognizes -inf as a
+    // hard ban that remains banned even with signed penalties.
+    y[tool_start_token_id] = bf16(common_sampling_enabled()
+        ? -std::numeric_limits<float>::infinity() : -1e30f);
 }
 
 std::string AutoModel::_shared_generate(chat_meta_info_t& meta_info, int length_limit, std::ostream& os, std::function<bool()> is_cancelled) {
@@ -535,6 +611,62 @@ void AutoModel::set_sampler(sampler_config& sampler_config) {
         this->sampler.reset();
     }
     this->sampler = std::make_unique<Sampler>(this->lm_config->get("vocab_size"), sampler_config);
+    const auto& config = sampler_config;
+    nlohmann::json defaults = {
+        {"do_sample", config.temperature != 0 && config.top_k != 1},
+        {"temperature", config.temperature}, {"top_k", config.top_k},
+        {"top_p", config.top_p}, {"min_p", config.min_p},
+        {"repetition_penalty", config.rep_penalty},
+        {"presence_penalty", config.pre_penalty}, {"frequency_penalty", config.freq_penalty},
+        {"random_seed", -1}};
+    if (config.has_rng_seed || config.rng_seed != 0) defaults["random_seed"] = config.rng_seed;
+    sampling_state_ = std::make_unique<flm::sampling::SamplingState>(
+        defaults, static_cast<int>(this->lm_config->get("vocab_size")));
+}
+
+void AutoModel::set_sampling_provider(const std::string& name) {
+    const auto provider = flm::sampling::parse_provider(name);
+    if (provider == flm::sampling::Provider::Common && !supports_common_sampling())
+        throw flm::sampling::SamplingRequestError("Common sampling is unavailable for this native model's token-history path");
+    if (!sampling_state_ || !sampler)
+        throw flm::sampling::SamplingRequestError("Sampling configuration needs a loaded model");
+    sampling_state_->set_default_provider(name);
+    configure_sampling_request(nlohmann::json::object());
+}
+
+void AutoModel::begin_sampling_turn() {
+    if (!common_sampling_enabled()) return;
+    if (!supports_common_sampling())
+        throw flm::sampling::SamplingRequestError("Common sampling is unavailable for this native model's token-history path");
+    sampler->configure_common(flm::sampling::sampling_logits_options(sampling_state_->effective()),
+                              &token_history, flm::sampling::request_seed(sampling_state_->effective()));
+}
+
+void AutoModel::configure_sampling_request(const nlohmann::json& options, bool reset) {
+    if (!sampling_state_ || !sampler)
+        throw flm::sampling::SamplingRequestError("Sampling configuration needs a loaded model");
+    auto candidate = *sampling_state_;
+    if (reset) candidate.reset_request(options);
+    else candidate.update(options);
+    if (candidate.provider() == flm::sampling::Provider::Common && !supports_common_sampling())
+        throw flm::sampling::SamplingRequestError("Common sampling is unavailable for this native model's token-history path");
+    *sampling_state_ = std::move(candidate);
+    if (common_sampling_enabled()) {
+        begin_sampling_turn();
+        return;
+    }
+    sampler->disable_common();
+    // Compatibility provider retains native setter/window behavior. Common
+    // request overrides never mutate these legacy fields or penalty/RNG state.
+    if (options.contains("temperature")) set_temperature(options.at("temperature").get<float>());
+    if (options.contains("top_k")) set_topk(options.at("top_k").get<int>());
+    if (options.contains("top_p")) set_topp(options.at("top_p").get<float>());
+    if (options.contains("min_p")) set_minp(options.at("min_p").get<float>());
+    if (options.contains("repetition_penalty")) set_repetition_penalty(options.at("repetition_penalty").get<float>());
+    if (options.contains("presence_penalty")) set_presence_penalty(options.at("presence_penalty").get<float>());
+    if (options.contains("frequency_penalty")) set_frequency_penalty(options.at("frequency_penalty").get<float>());
+    if (options.contains("seed") && options.at("seed").get<int>() >= 0)
+        sampler->set_seed(static_cast<uint64_t>(options.at("seed").get<int>()));
 }
 
 /// \brief Set the max length
@@ -622,6 +754,7 @@ void AutoModel::verbose() {
 /// \note The function will set the top-k
 /// \note The function will check if the top-k is valid
 void AutoModel::set_topk(int topk) {
+    if (common_sampling_enabled()) { configure_sampling_request({{"top_k", topk}}, false); return; }
     if (topk < 1) {
         header_print("WARNING", "Top-k must be greater than 0");
         return;
@@ -639,6 +772,7 @@ void AutoModel::set_topk(int topk) {
 /// \note The function will set the top-p
 /// \note The function will check if the top-p is valid
 void AutoModel::set_topp(float topp) {
+    if (common_sampling_enabled()) { configure_sampling_request({{"top_p", topp}}, false); return; }
     if (topp < 0.0f || topp > 1.0f) {
         header_print("WARNING", "Top-p must be between 0.0 and 1.0");
         return;
@@ -651,6 +785,7 @@ void AutoModel::set_topp(float topp) {
 /// \note The function will set the min-p
 /// \note The function will check if the min-p is valid
 void AutoModel::set_minp(float minp) {
+    if (common_sampling_enabled()) { configure_sampling_request({{"min_p", minp}}, false); return; }
     if (minp < 0.0f || minp > 1.0f) {
         header_print("WARNING", "Min-p must be between 0.0 and 1.0");
         return;
@@ -663,6 +798,7 @@ void AutoModel::set_minp(float minp) {
 /// \note The function will set the temperature
 /// \note The function will check if the temperature is valid
 void AutoModel::set_temperature(float temperature) {
+    if (common_sampling_enabled()) { configure_sampling_request({{"temperature", temperature}}, false); return; }
     if (temperature < 0.0f) {
         header_print("WARNING", "Temperature must be greater than 0.0");
         return;
@@ -675,6 +811,7 @@ void AutoModel::set_temperature(float temperature) {
 /// \note The function will set the presence penalty
 /// \note The function will check if the presence penalty is valid
 void AutoModel::set_presence_penalty(float presence_penalty) {
+    if (common_sampling_enabled()) { configure_sampling_request({{"presence_penalty", presence_penalty}}, false); return; }
     if (presence_penalty < 0.0f) {
         header_print("WARNING", "Presence penalty must be greater than 0.0");
         return;
@@ -687,6 +824,7 @@ void AutoModel::set_presence_penalty(float presence_penalty) {
 /// \note The function will set the repetition penalty
 /// \note The function will check if the repetition penalty is valid
 void AutoModel::set_repetition_penalty(float repetition_penalty) {
+    if (common_sampling_enabled()) { configure_sampling_request({{"repetition_penalty", repetition_penalty}}, false); return; }
     if (repetition_penalty < 0.0f) {
         header_print("WARNING", "Repetition penalty must be greater than 0.0");
         return;
@@ -700,6 +838,7 @@ void AutoModel::set_repetition_penalty(float repetition_penalty) {
 /// \brief Set the frequency penalty
 /// \param frequency_
 void AutoModel::set_frequency_penalty(float frequency_penalty) {
+    if (common_sampling_enabled()) { configure_sampling_request({{"frequency_penalty", frequency_penalty}}, false); return; }
     if (frequency_penalty < 0.0f) {
         header_print("WARNING", "Frequency penalty must be greater than 0.0");
         return;

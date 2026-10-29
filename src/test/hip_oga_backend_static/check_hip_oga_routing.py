@@ -46,6 +46,16 @@ def git_output(*args: str) -> str:
     return result.stdout.strip()
 
 
+def compile_test(source: Path, binary: Path) -> list[str]:
+    compiler = os.environ.get("CXX", "cl.exe" if os.name == "nt" else "g++")
+    if Path(compiler).name.lower() in {"cl", "cl.exe", "clang-cl", "clang-cl.exe"}:
+        return [compiler, "/nologo", "/EHsc", "/std:c++20", "/utf-8",
+                "/I" + str(ROOT / "src/include"), str(source),
+                "/Fe:" + str(binary), "/Fo:" + str(binary.with_suffix(".obj"))]
+    return [compiler, "-std=c++20", "-I", str(ROOT / "src/include"),
+            str(source), "-o", str(binary)]
+
+
 cmake = read("src/CMakeLists.txt")
 program_args = read("src/include/program_args.hpp")
 vm_args = read("src/include/utils/vm_args.hpp")
@@ -309,30 +319,30 @@ for forbidden_public_repo in (
 expected_public_tags = {
     "hip-qwen2.5-coder:14b": {
         "repo_id": "amd/Qwen2.5-Coder-14B-Instruct_gpuep_1.0_gpu_128",
-        "revision": "6de529bb30355eac01ad8daab89cda657ddf0418",
+        "revision": "df388f560940da634097518f1da337b36a977b3a",
         "model_kind": "text",
-        "unsupported": False,
-        "size": 8853580693,
-        "support_status": "strict_gpu",
-        "labels": {"hip", "text", "strict_gpu", "default"},
+        "unsupported": True,
+        "size": 8853576872,
+        "support_status": "unqualified",
+        "labels": {"hip", "text", "unqualified", "default"},
         "source_subdir": "Upload Qwen2.5 ONNX files",
     },
     "hip-qwen2.5:14b": {
         "repo_id": "amd/Qwen2.5-14B-Instruct_gpuep_1.0_gpu_128",
         "revision": "b36841769dc5c3331a2d611c07e9c5f750377d5f",
         "model_kind": "text",
-        "unsupported": False,
+        "unsupported": True,
         "size": 8853580604,
-        "support_status": "strict_gpu",
-        "labels": {"hip", "text", "strict_gpu", "alternate"},
+        "support_status": "unqualified",
+        "labels": {"hip", "text", "unqualified", "alternate"},
         "source_subdir": "Upload Qwen2.5 ONNX files",
     },
     "hip-gemma3:4b": {
         "repo_id": "amd/Gemma3-4B-it_gpuep_1.0_gpu_128",
-        "revision": "72825e7565eaf95a69416a68a2274e367b6d3fcb",
+        "revision": "67e57aeb12f71ec7ac94068c433d8de075653863",
         "model_kind": "vlm",
         "unsupported": True,
-        "size": 4359351642,
+        "size": 4359347995,
         "support_status": "hybrid_gpu_experimental",
         "labels": {"hip", "vision", "hybrid_gpu", "experimental", "unqualified"},
         "source_subdir": "Upload gemma3-4b-it ONNX files",
@@ -399,7 +409,7 @@ for tag, expected in expected_public_tags.items():
             f"{tag} installer manifest must flatten source_subdir entries")
     if expected["unsupported"]:
         require("unsupported_reason" in hip_oga and hip_oga["unsupported_reason"],
-                f"{tag} VLM entry must be clearly marked unsupported")
+                f"{tag} failed or unqualified public package must be gated")
     else:
         require("unsupported_reason" not in hip_oga,
                 f"{tag} text trial entry must not be marked unsupported")
@@ -427,7 +437,7 @@ require("model_info[\"hip_oga\"][\"config_path\"] = model_path" in runner,
 require("report_hip_oga_offload_policy" in runner,
         "Runner must report selected HIP OGA offload policy before load")
 require("initial_prompt(args.input_file_name)" in runner and
-        "this->generate_limit = args.max_tokens" in runner,
+        "this->generate_limit = (this->tool_session && args.max_tokens == -1) ? 256 : args.max_tokens;" in runner,
         "Runner does not wire --prompt/--max-tokens into one-shot generation")
 require("generate_once(this->initial_prompt" in runner,
         "Runner does not execute --prompt non-interactively")
@@ -542,9 +552,9 @@ require("decoder_execution.use_oga && this->is_normal_token" in adapter and
 require("multimodal_turn_ = true" in adapter and
         "OgaTokenizerStream::Create(*processor_)" in adapter,
         "media decoding must preserve processor stream selection")
-require("force_oga_text_providers_for_media" in adapter and
-        "media request forces HIP OGA text providers" in adapter,
-        "HIP adapter must force media requests through OGA text providers")
+require("force_oga_text_providers_for_media" not in adapter and
+        "HIP OGA request codec=" in adapter and "HIP OGA decoder execution=" in adapter,
+        "HIP adapter must retain image output selection and report actual decoder execution")
 require("encode_prompt_with_selected_provider" in adapter and
         "decode_token_with_selected_provider" in adapter,
         "HIP adapter must route tokenizer/decoder through independent selectors")
@@ -613,7 +623,7 @@ for name, branch in (
         require(token not in branch,
                 f"{name} should not use NPU/download path token: {token}")
 
-require(chat_stream_branch.count("auto_chat_engine->insert(meta_info, uniformed_input)") == 1,
+require(chat_stream_branch.count("auto_chat_engine->insert(meta_info, uniformed_input") == 1,
         "/api/chat streaming should prefill exactly once")
 require("auto_chat_engine->generate(meta_info, length_limit, ostream" in chat_stream_branch,
         "/api/chat streaming does not generate after prefill")
@@ -621,8 +631,8 @@ require("auto_chat_engine->generate(meta_info, length_limit, ostream" in chat_st
 adapter_lower = adapter.lower()
 for token in ("open_npu_device", "flm_rt::device(", "xrt::", "amdxdna", ".xclbin", "xclbin_manager("):
     require(token not in adapter_lower, f"HIP adapter should not reference NPU runtime token: {token}")
-for token in ("TextCodecProvider", "text_codec_execution",
-              "default_text_codec_selector"):
+for token in ("TextCodecSelector", "text_codec_execution",
+              "active_decoder_provider_selector_ = this->decoder_provider_selector_"):
     require(token in adapter,
             f"HIP adapter must wire external text-codec selector path: {token}")
 for env_name in ("FLM_HIP_OGA_TOKENIZER_PROVIDER",
@@ -636,14 +646,14 @@ require("FLM_HIP_OGA_TEMPLATE_PROVIDER" not in hip_oga_docs and
 require("OgaConfig::Create" in adapter, "HIP adapter does not create OGA config")
 require("static OgaHandle handle" in adapter,
         "HIP adapter does not register OgaHandle for deterministic OGA shutdown")
-require("build_session_overlay" in adapter, "HIP adapter must build a provider/session overlay")
-require("config_->Overlay" in adapter, "HIP adapter must apply provider/session overlay through OgaConfig::Overlay")
-require("session.disable_cpu_ep_fallback" in adapter,
-        "HIP adapter strict_gpu policy must disable ORT CPU EP fallback")
-require("disable_cpu_ep_fallback" in adapter,
-        "HIP adapter strict_gpu policy must set OGA disable_cpu_ep_fallback session option")
-require('session_options["disable_cpu_ep_fallback"] = "1"' in hip_oga_policy_hpp,
-        "OGA overlay must encode disable_cpu_ep_fallback as the string value expected by the corrected runtime")
+require("build_effective_config" in adapter and "ScopedConfigDirectory" in adapter,
+        "HIP adapter must prepare complete session configuration before OGA creation")
+require("config_->Overlay" not in adapter and
+        "OgaConfig::Create(config_directory_->path().string().c_str())" in adapter,
+        "HIP adapter must initialize optional session providers from the effective config directory")
+require('session_options["session.disable_cpu_ep_fallback"]' in hip_oga_policy_hpp and
+        'policy == kStrictGpuPolicy ? "1" : "0"' in hip_oga_policy_hpp,
+        "OGA policy must use the effective ORT fallback key with explicit strict/hybrid string values")
 require("FLM_HIP_OGA_DIAGNOSTICS" in adapter and "enable_profiling" in hip_oga_policy_hpp,
         "HIP adapter must expose diagnostics for per-section ORT profile evidence")
 require("FLM_HIP_OGA_PREFIX_CACHE" in rest_handler,
@@ -667,8 +677,9 @@ require("disable_for_session" in adapter,
         "HIP adapter must disable reuse for the current session after provider exceptions")
 require("reset_decoder_stream" in adapter and "token_stream_ = OgaTokenizerStream::Create" in adapter,
         "HIP adapter must recreate OgaTokenizerStream for each generated response")
-require("multimodal_forced_miss" in adapter and "prefix_cache_.reset_checkpoint" in adapter,
-        "HIP adapter must force VLM/image/audio requests to miss and reset the text checkpoint")
+require("prepare_multimodal_turn" in adapter and "prepared.identity" in adapter and
+        "media_rewind_qualified_" in adapter and "past_present_share_buffer" in adapter,
+        "HIP adapter must guard media reuse with qualified config and prepared identity")
 require("hip_oga_request_signature" in rest_handler,
         "REST handlers must pass a request/search signature into the HIP OGA adapter")
 require("test_vlm_request_forces_miss_and_clears_checkpoint" in prefix_cache_test and
@@ -723,17 +734,16 @@ require("collect_hip_oga_image_inputs(input)" in adapter,
         "HIP adapter must collect CLI and server-normalized image inputs")
 require("reject_hip_oga_audio_inputs(input)" in adapter,
         "HIP adapter must fail fast for audio inputs until OGA audio packages are verified")
-require("hip_engine->begin_multimodal_turn(templated_text, images)" in adapter,
+require("hip_engine->begin_multimodal_turn(prepared," in adapter,
         "HIP adapter must route image prompts through the native OGA multimodal turn")
 require("OgaMultiModalProcessor::Create" in adapter,
         "HIP adapter must create an OGA multimodal processor")
 require("OgaImages::Load" in adapter,
         "HIP adapter must load encoded image buffers through OgaImages")
 require("OgaNamedTensors" in adapter and
-        ("inputs->Get(\"input_ids\")" in adapter or
-         "inputs.Get(\"input_ids\")" in adapter),
+        ("read_oga_token_tensor(*prepared.inputs, \"input_ids\")" in adapter),
         "HIP adapter must inspect OGA named tensor input_ids for prompt accounting")
-require("generator_->SetInputs(*inputs)" in adapter,
+require("generator_->SetInputs(*prepared.inputs)" in adapter,
         "HIP adapter must pass processor-produced named tensors to the OGA generator")
 require("OgaTokenizerStream::Create(*processor_)" in adapter,
         "HIP adapter must use processor-aware decoding after multimodal prefill")
@@ -746,7 +756,7 @@ require("Audio inputs fail fast" in hip_oga_docs,
 require("strict_gpu" in hip_oga_docs and "hybrid_gpu" in hip_oga_docs and
         "FLM_HIP_OGA_DIAGNOSTICS" in hip_oga_docs,
         "HIP OGA docs must document strict/hybrid policy and diagnostics")
-require("hip_engine->generate_next_token(sampled_token)" in adapter,
+require("hip_engine->generate_next_token(sampled_token, meta_info.constraint.get(), decoder_bans)" in adapter,
         "HIP adapter must consume OGA-generated token ids for user-visible text")
 
 decode_token_helper = re.search(
@@ -803,12 +813,14 @@ require("parse_stream_content_final" in read("src/include/AutoModel/hip_oga_mode
         "HIP adapter must override final streaming parser cleanup")
 require("call_\" + std::to_string(std::time(nullptr))" not in adapter,
         "HIP streaming tool-call IDs must not be timestamp-only; two tool calls in one second collide")
-require("const std::string tool_call_id = result.tool_id.empty()" in streaming_openai and
-        "std::to_string(tool_call_index)" in streaming_openai,
-        "OpenAI stream assembler must assign a unique per-stream id for each emitted tool call")
+require("output_->update(content, parser_final)" in streaming_openai and
+        'call["id"] = d.tool_id' in streaming_openai and
+        '"index", d.tool_index' in streaming_openai and
+        "next.tool_calls[i].id = tool_ids_[i]" in read("src/common/chat/chat_stream.cpp"),
+        "OpenAI stream assembler must forward the request parser's stable per-call IDs and indices")
 require("model_output_error" in rest_handler,
         "OpenAI chat route must return explicit model-output errors for unsupported tool markup")
-require("tool_choice=none" in rest_handler and "tools_for_template" in rest_handler,
+require("tool_choice_mode == TOOL_CHOICE_NONE ? json::array() : tools" in rest_handler,
         "OpenAI chat route must hide tools from the template when tool_choice=none")
 require("int HipOgaModel::get_tool_start_token_id() const" in adapter,
         "HIP adapter must expose its tool-start masking decision")
@@ -858,15 +870,8 @@ if tokenizer_parity.returncode != 0:
 with tempfile.TemporaryDirectory(prefix="flm-hip-oga-text-codec-") as tmpdir:
     text_codec_binary = Path(tmpdir) / (
         "hip_oga_text_codec_test.exe" if os.name == "nt" else "hip_oga_text_codec_test")
-    compile_cmd = [
-        os.environ.get("CXX", "g++"),
-        "-std=c++20",
-        "-I",
-        str(ROOT / "src/include"),
-        str(ROOT / "src/test/hip_oga_backend_static/test_hip_oga_text_codec.cpp"),
-        "-o",
-        str(text_codec_binary),
-    ]
+    compile_cmd = compile_test(
+        ROOT / "src/test/hip_oga_backend_static/test_hip_oga_text_codec.cpp", text_codec_binary)
     compile_result = subprocess.run(
         compile_cmd,
         cwd=ROOT,
@@ -891,22 +896,14 @@ with tempfile.TemporaryDirectory(prefix="flm-hip-oga-text-codec-") as tmpdir:
 
 with tempfile.TemporaryDirectory(prefix="flm-hip-oga-codec-options-") as tmpdir:
     binary = Path(tmpdir) / ("codec_options.exe" if os.name == "nt" else "codec_options")
-    subprocess.run([os.environ.get("CXX", "g++"), "-std=c++20", "-I", str(ROOT / "src/include"),
-                    str(ROOT / "src/test/hip_oga_backend_static/test_hip_oga_codec_options.cpp"),
-                    "-o", str(binary)], cwd=ROOT, check=True)
+    subprocess.run(compile_test(
+        ROOT / "src/test/hip_oga_backend_static/test_hip_oga_codec_options.cpp", binary),
+        cwd=ROOT, check=True)
     subprocess.run([str(binary)], cwd=ROOT, check=True)
 
 with tempfile.TemporaryDirectory(prefix="flm-hip-oga-tool-parser-") as tmpdir:
     parser_test = Path(tmpdir) / ("hip_oga_tool_parser_test.exe" if os.name == "nt" else "hip_oga_tool_parser_test")
-    compile_cmd = [
-        os.environ.get("CXX", "g++"),
-        "-std=c++20",
-        "-I",
-        str(ROOT / "src/include"),
-        str(tool_parser_cpp),
-        "-o",
-        str(parser_test),
-    ]
+    compile_cmd = compile_test(tool_parser_cpp, parser_test)
     compile_result = subprocess.run(
         compile_cmd,
         cwd=ROOT,

@@ -4,12 +4,41 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 namespace flm::hip_oga {
+
+struct MediaTensorIdentity {
+    std::string name;
+    int element_type = 0;
+    std::vector<std::int64_t> shape;
+    std::vector<std::uint8_t> bytes;
+
+    bool operator==(const MediaTensorIdentity& other) const {
+        return name == other.name && element_type == other.element_type &&
+               shape == other.shape && bytes == other.bytes;
+    }
+};
+
+struct MediaCacheIdentity {
+    std::vector<std::vector<std::uint8_t>> images;
+    std::string processor_signature;
+    std::vector<MediaTensorIdentity> processor_tensors;
+    std::vector<int> token_types;
+
+    bool valid_for(std::size_t token_count) const {
+        return !images.empty() &&
+            std::all_of(images.begin(), images.end(),
+                        [](const auto& image) { return !image.empty(); }) &&
+            !processor_signature.empty() && !processor_tensors.empty() &&
+            token_types.size() == token_count;
+    }
+};
 
 enum class PrefixCacheDecisionKind {
     Fresh,
@@ -38,7 +67,8 @@ public:
                                  std::string_view signature,
                                  std::size_t required_capacity,
                                  std::size_t generator_capacity,
-                                 const std::vector<int>& prompt_tokens) {
+                                 const std::vector<int>& prompt_tokens,
+                                 const MediaCacheIdentity* media = nullptr) {
         PrefixCacheDecision decision;
         decision.newly_prefilled_tokens = prompt_tokens.size();
 
@@ -46,9 +76,15 @@ public:
             decision.reason = "disabled";
             return decision;
         }
-        if (!text_only) {
+        if (!text_only && media == nullptr) {
             reset_checkpoint("multimodal_forced_miss");
             decision.reason = "multimodal_forced_miss";
+            return decision;
+        }
+        if ((!text_only && !media->valid_for(prompt_tokens.size())) ||
+            (text_only && media != nullptr)) {
+            reset_checkpoint("invalid_media_identity");
+            decision.reason = "invalid_media_identity";
             return decision;
         }
         if (!restore_allowed) {
@@ -63,6 +99,11 @@ public:
         }
         if (checkpoint_tokens_.empty()) {
             decision.reason = "no_checkpoint";
+            return decision;
+        }
+        if (media_.has_value() != !text_only) {
+            reset_checkpoint("input_domain_changed");
+            decision.reason = "input_domain_changed";
             return decision;
         }
         if (signature_ != signature) {
@@ -84,6 +125,38 @@ public:
             return decision;
         }
 
+        if (media_) {
+            const char* mismatch = nullptr;
+            if (media_->images != media->images) {
+                mismatch = "media_changed";
+            } else if (media_->processor_signature != media->processor_signature ||
+                       media_->processor_tensors != media->processor_tensors) {
+                mismatch = "preprocessing_changed";
+            } else if (!std::equal(media_->token_types.begin(), media_->token_types.end(),
+                                   media->token_types.begin()) ||
+                       !std::all_of(media->token_types.begin() +
+                                       static_cast<std::ptrdiff_t>(checkpoint_tokens_.size()),
+                                    media->token_types.end(),
+                                    [](int type) { return type == 0; })) {
+                mismatch = "media_layout_changed";
+            }
+            if (mismatch != nullptr) {
+                reset_checkpoint(mismatch);
+                decision.reason = mismatch;
+                return decision;
+            }
+        }
+
+        // OGA rewind prepares the token at the checkpoint for replay. Without
+        // an appended suffix, GenerateNextToken can advance by two positions
+        // and the adapter would expose only the last token. Rebuild identical
+        // prompts until an explicit last-prompt-token replay path is supported.
+        if (prompt_tokens.size() == checkpoint_tokens_.size()) {
+            reset_checkpoint("empty_suffix");
+            decision.reason = "empty_suffix";
+            return decision;
+        }
+
         decision.kind = PrefixCacheDecisionKind::Reuse;
         decision.reuse = true;
         decision.reason = "hit";
@@ -96,8 +169,17 @@ public:
 
     void commit_checkpoint(std::vector<int> prompt_tokens,
                            std::string signature,
-                           std::size_t generator_capacity) {
+                           std::size_t generator_capacity,
+                           std::optional<MediaCacheIdentity> media = std::nullopt) {
+        // Text commits retain their existing diagnostic checkpoint behavior;
+        // disabled media sessions must not retain large processor identities.
+        if (disabled_for_session_ && media) return;
+        if (media && !media->valid_for(prompt_tokens.size())) {
+            reset_checkpoint("invalid_media_identity");
+            return;
+        }
         checkpoint_tokens_ = std::move(prompt_tokens);
+        media_ = std::move(media);
         signature_ = std::move(signature);
         generator_capacity_ = generator_capacity;
         last_reason_ = "checkpoint";
@@ -105,6 +187,7 @@ public:
 
     void reset_checkpoint(std::string reason) {
         checkpoint_tokens_.clear();
+        media_.reset();
         signature_.clear();
         generator_capacity_ = 0;
         last_reason_ = std::move(reason);
@@ -142,6 +225,7 @@ public:
 
 private:
     std::vector<int> checkpoint_tokens_;
+    std::optional<MediaCacheIdentity> media_;
     std::string signature_;
     std::size_t generator_capacity_ = 0;
     bool disabled_for_session_ = false;

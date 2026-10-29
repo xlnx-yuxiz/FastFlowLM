@@ -111,15 +111,15 @@ protected:
     /// \note  Overridden by Gemma4e_Flash to read them off the flash engine.
     virtual gemma4e_engine_config_t engine_config() const;
 
-    /// \brief Builds the engine behind this wrapper; load_model() calls it.
+    /// \brief Selects the concrete engine family behind this wrapper.
     /// \note  Overridden by Gemma4e_Flash to swap in the flash engine. Everything
     ///        else -- weights, tokenizer, sampler, chat template -- is identical.
-    virtual void create_engine();
+    std::string backend_family(const json&) const override;
 
 public:
     Gemma4e(flm_rt::device* npu_device_inst);
 
-    void load_model(std::string model_path, json model_inf, int default_context_length = -1, bool enable_preemption = false) override;
+    void load_model(std::string model_path, json model_inf, int default_context_length = -1, bool enable_preemption = false, const std::string& backend = "") override;
     bool insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, std::function<bool()> is_cancelled = [] { return false; }) override;
     std::string generate(chat_meta_info_t& meta_info, int length_limit, std::ostream& os, std::function<bool()> is_cancelled = [] { return false; }) override;
     std::string generate_with_prompt(chat_meta_info_t& meta_info, lm_uniform_input_t& input, int length_limit, std::ostream& os = std::cout) override;
@@ -229,7 +229,7 @@ private:
     void _reset_turn();
 
 protected:
-    void create_engine() override;
+    std::string backend_family(const json&) const override;
     gemma4e_engine_config_t engine_config() const override;
 
 public:

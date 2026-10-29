@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>      // for std::exp
 #include <limits>
+#include <type_traits>
 
 /// \brief Constructor
 /// \param in_features the input features
@@ -53,6 +54,14 @@ Sampler::Sampler(int in_features, sampler_config& config) {
 
 void Sampler::set_seed(uint64_t seed) {
     rng_.seed(seed);
+}
+
+void Sampler::configure_common(const flm::sampling::LogitsOptions& options,
+                               const std::vector<int>* logical_history, uint64_t seed) {
+    if (!logical_history) throw std::invalid_argument("Common sampler requires logical history");
+    common_options_ = options;
+    common_history_ = logical_history;
+    common_sampler_.reset(seed);
 }
 
 /// \brief Reset the penalties
@@ -443,6 +452,15 @@ int Sampler::sample_greedy(buffer<bf16>& x) {
 }
 
 int Sampler::sample(buffer<bf16>& x) {
+    if (common_history_) {
+        static_assert(std::is_same<int, int32_t>::value, "Token IDs must be int32");
+        if (in_features <= 0 || x.size() < static_cast<std::size_t>(in_features))
+            throw std::invalid_argument("Common sampler logits row is too small");
+        std::vector<float> scores(static_cast<std::size_t>(in_features));
+        for (int i = 0; i < in_features; ++i) scores[i] = static_cast<float>(x[i]);
+        return common_sampler_.sample(std::move(scores), common_history_->data(),
+                                      common_history_->size(), common_options_);
+    }
     // PRNG is seeded once at construction, no per-call seeding needed
     if (this->top_k == 1) {
         return sample_greedy(x);

@@ -2,7 +2,7 @@
 #define __error_measure_cpu__
 
 #include <type_traits> // Required for std::is_same_v
-#include <stdfloat>
+#include <cmath>
 #include <algorithm> // For std::min
 template<typename Ta,typename Tb >
 float get_relativeL2(Ta* y, Tb* y_ref, int batch_size, int seq_len, int hidden_size, int seq_len_padded, int hidden_size_padded){

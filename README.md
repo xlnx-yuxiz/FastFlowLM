@@ -1,12 +1,15 @@
-# HIP OGA Demo Branch
+# HIP OGA experimental integration
 
-This branch adds an experimental FastFlowLM backend for AMDGPU through ONNX
-Runtime GenAI and HIP EP. It also includes an opt-in text prefix cache. See
-[HIP_OGA_DEMO.md](HIP_OGA_DEMO.md) for build, model, runtime, and validation
-details.
+This branch adds an experimental AMDGPU/HIP backend through ONNX Runtime
+GenAI, selectable OGA/FLM text codecs, prefix-cache recovery and media handling,
+structured output and tools, and shared sampling via `--sampler backend|common`.
+See [HIP_OGA_DEMO.md](HIP_OGA_DEMO.md) for prerequisites, examples, tested scope
+and current limits.
 
-The prefix cache is disabled by default and is not a production-readiness or
-performance claim.
+The default sampler remains `backend`; prefix caching remains opt-in.
+Common sampling is qualified for retained HIP text packages; real NPU model
+generation with common sampling remains unqualified. The upstream NPU release
+downloads below do not include this experimental HIP branch.
 
 ---
 

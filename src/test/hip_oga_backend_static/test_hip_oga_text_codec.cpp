@@ -356,6 +356,118 @@ void test_external_cumulative_decoder_holds_split_utf8_until_final_flush() {
             "final flush should emit the complete UTF-8 sequence");
 }
 
+void test_external_cumulative_decoder_withholds_temporary_replacement_before_metaspace() {
+    // Observed Gemma ByteFallback snapshots: incomplete bytes become U+FFFD
+    // until the third byte completes the literal metaspace scalar.
+    const std::string prefix = "{\"s\":\"  a   b  ";
+    const std::string replacement("\xEF\xBF\xBD", 3);
+    const std::string metaspace("\xE2\x96\x81", 3);
+    const std::unordered_map<std::string, std::string> decoded_by_tokens = {
+        {"1", prefix + replacement},
+        {"1,2", prefix + replacement + replacement},
+        {"1,2,3", prefix + metaspace},
+        {"1,2,3,4", prefix + metaspace + "!"},
+    };
+    flm::hip_oga::ExternalCumulativeDetokenizer decoder(
+        [&](const std::vector<int>& token_ids) {
+            return flm::hip_oga::CumulativeDecodeResult::match(
+                decoded_by_tokens.at(flm::hip_oga::join_token_ids_for_evidence(token_ids)));
+        });
+
+    for (int token_id : {1, 2, 3, 4}) {
+        const auto chunk = decoder.append_token(token_id);
+        require(chunk.status == ParityStatus::Match,
+                "temporary-replacement metaspace snapshot should remain decodable");
+        require(chunk.emitted_text.find(replacement) == std::string::npos,
+                "temporary replacement bytes must never be emitted");
+        require(decoder.emitted_text().find(replacement) == std::string::npos,
+                "temporary replacement bytes must not enter cumulative emitted text");
+    }
+    const auto final = decoder.finish();
+    require(final.status == ParityStatus::Match,
+            "resolved metaspace snapshot should finish cleanly");
+    require(decoder.emitted_text() == prefix + metaspace + "!",
+            "temporary replacement snapshots must resolve to exact final metaspace text");
+}
+
+void test_external_cumulative_decoder_withholds_four_byte_emoji_replacement_snapshots() {
+    // The same real tokenizer boundary can remain unresolved for three tokens.
+    const std::string prefix = "emoji:";
+    const std::string replacement("\xEF\xBF\xBD", 3);
+    const std::string emoji("\xF0\x9F\x99\x82", 4);
+    const std::unordered_map<std::string, std::string> decoded_by_tokens = {
+        {"1", prefix + replacement},
+        {"1,2", prefix + replacement + replacement},
+        {"1,2,3", prefix + replacement + replacement + replacement},
+        {"1,2,3,4", prefix + emoji},
+    };
+    flm::hip_oga::ExternalCumulativeDetokenizer decoder(
+        [&](const std::vector<int>& token_ids) {
+            return flm::hip_oga::CumulativeDecodeResult::match(
+                decoded_by_tokens.at(flm::hip_oga::join_token_ids_for_evidence(token_ids)));
+        });
+
+    for (int token_id : {1, 2, 3, 4}) {
+        const auto chunk = decoder.append_token(token_id);
+        require(chunk.status == ParityStatus::Match,
+                "four-byte emoji replacement snapshot should remain decodable");
+        require(chunk.emitted_text.find(replacement) == std::string::npos,
+                "incomplete four-byte emoji must not emit replacement characters");
+        require(decoder.emitted_text().find(replacement) == std::string::npos,
+                "incomplete four-byte emoji replacements must stay out of cumulative output");
+    }
+    const auto final = decoder.finish();
+    require(final.status == ParityStatus::Match,
+            "completed four-byte emoji should finish cleanly");
+    require(decoder.emitted_text() == prefix + emoji,
+            "four-byte emoji must resolve to exact final text");
+}
+
+void test_external_cumulative_decoder_preserves_literal_replacement_before_text() {
+    const std::string prefix = "literal:";
+    const std::string replacement("\xEF\xBF\xBD", 3);
+    const std::unordered_map<std::string, std::string> decoded_by_tokens = {
+        {"1", prefix + replacement},
+        {"1,2", prefix + replacement + "!"},
+    };
+    flm::hip_oga::ExternalCumulativeDetokenizer decoder(
+        [&](const std::vector<int>& token_ids) {
+            return flm::hip_oga::CumulativeDecodeResult::match(
+                decoded_by_tokens.at(flm::hip_oga::join_token_ids_for_evidence(token_ids)));
+        });
+
+    require(decoder.append_token(1).emitted_text.empty(),
+            "literal replacement character should wait for a following stable snapshot");
+    auto stable = decoder.append_token(2);
+    require(stable.status == ParityStatus::Match,
+            "literal replacement followed by text should decode cleanly");
+    require(stable.emitted_text == prefix + replacement,
+            "literal replacement should be preserved when ordinary text stabilizes it");
+    require(decoder.finish().emitted_text == "!",
+            "ordinary text after literal replacement should flush exactly once");
+    require(decoder.emitted_text() == prefix + replacement + "!",
+            "literal replacement followed by ordinary text must be preserved exactly once");
+}
+
+void test_external_cumulative_decoder_preserves_literal_replacement_at_finish() {
+    const std::string prefix = "literal:";
+    const std::string replacement("\xEF\xBF\xBD", 3);
+    flm::hip_oga::ExternalCumulativeDetokenizer decoder(
+        [&](const std::vector<int>&) {
+            return flm::hip_oga::CumulativeDecodeResult::match(prefix + replacement);
+        });
+
+    require(decoder.append_token(1).emitted_text.empty(),
+            "single literal replacement snapshot should remain pending until final flush");
+    const auto final = decoder.finish();
+    require(final.status == ParityStatus::Match,
+            "literal replacement should be valid final UTF-8");
+    require(final.emitted_text == prefix + replacement,
+            "final flush should preserve a literal replacement character");
+    require(decoder.emitted_text() == prefix + replacement,
+            "literal replacement at finish must be preserved exactly once");
+}
+
 void test_external_cumulative_decoder_fails_closed_on_final_invalid_utf8() {
     flm::hip_oga::ExternalCumulativeDetokenizer decoder(
         [](const std::vector<int>&) {
@@ -436,6 +548,10 @@ int main() {
     test_external_cumulative_decoder_delays_until_prefix_is_stable();
     test_external_cumulative_decoder_may_lag_immediate_oga_stream();
     test_external_cumulative_decoder_holds_split_utf8_until_final_flush();
+    test_external_cumulative_decoder_withholds_temporary_replacement_before_metaspace();
+    test_external_cumulative_decoder_withholds_four_byte_emoji_replacement_snapshots();
+    test_external_cumulative_decoder_preserves_literal_replacement_before_text();
+    test_external_cumulative_decoder_preserves_literal_replacement_at_finish();
     test_external_cumulative_decoder_fails_closed_on_final_invalid_utf8();
     test_external_cumulative_decoder_fails_closed_when_emitted_prefix_is_revised();
     test_external_cumulative_decoder_allows_callback_to_hide_special_tokens();

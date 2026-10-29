@@ -13,39 +13,37 @@
 /************              Qwen3VL family            **************/
 Qwen3VL::Qwen3VL(flm_rt::device* npu_device_inst) : AutoModel(npu_device_inst, "Qwen3VL") {}
 
-void Qwen3VL::create_engine() {
-    this->lm_engine = std::make_unique<qwen3vl_npu>(*this->lm_config, this->npu.get(), this->MAX_L);
+std::string Qwen3VL::backend_family(const json&) const {
+    return "qwen3vl";
 }
 
-void Qwen3VL_Flash::create_engine() {
-    this->lm_engine = std::make_unique<qwen3vl_flash>(*this->lm_config, this->npu.get(), this->MAX_L);
+std::string Qwen3VL_Flash::backend_family(const json&) const {
+    return "qwen3vl-flash";
 }
 
-void Qwen3VL::load_model(std::string model_path, json model_info, int default_context_length, bool enable_preemption) {
-    this->_shared_load_model(model_path, model_info, default_context_length, enable_preemption);
-    
-    this->q4nx = std::make_unique<Q4NX>(this->model_path);
-    // lm_config->get<std::string>("model_type", "") == qwen3
-    this->create_engine();
+void Qwen3VL::load_model(std::string model_path, json model_info, int default_context_length, bool enable_preemption, const std::string& backend) {
+    this->_shared_load_backend(model_path, model_info, default_context_length, enable_preemption, backend);
+    try {
 
-    this->lm_engine->load_weights(*this->q4nx);
-    //free the q4nx
-    this->q4nx.reset();
-    this->lm_engine->clear_context();
-    this->setup_tokenizer(model_path);
-    this->sampler.reset();
+        this->setup_tokenizer(model_path);
+        this->sampler.reset();
 
-    sampler_config config;
-    config.top_k = 40;
-    config.top_p = 0.9;
-    config.min_p = 0.1;
-    config.temperature = 0.8;
-    config.rep_penalty = 1.05;
-    config.freq_penalty = 1.05;
+        sampler_config config;
+        config.top_k = 40;
+        config.top_p = 0.9;
+        config.min_p = 0.1;
+        config.temperature = 0.8;
+        config.rep_penalty = 1.05;
+        config.freq_penalty = 1.05;
 
-    this->set_sampler(config);
-    for (size_t i = 0; i < PROFILER_TYPE_NUM; i++) {
-        this->profiler_list[i].reset();
+        this->set_sampler(config);
+        for (size_t i = 0; i < PROFILER_TYPE_NUM; i++) {
+            this->profiler_list[i].reset();
+        }
+        this->is_model_loaded = true;
+    } catch (...) {
+        this->_release_model_state();
+        throw;
     }
 }
 
@@ -591,6 +589,7 @@ bool Qwen3VL_Flash::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& inpu
     this->total_tokens = static_cast<uint32_t>(tokens.size());
 
     this->profiler_list[SAMPLING_TIME].start();
+    begin_sampling_turn();
     this->last_token = this->sampler->sample(y);
     this->profiler_list[SAMPLING_TIME].stop(1);
     return true;

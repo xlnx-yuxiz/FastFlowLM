@@ -8,6 +8,7 @@
 
 #include "ort_genai.h"
 #include "hip_oga_policy.hpp"
+#include "hip_oga_config_directory.hpp"
 
 #include <cstdlib>
 #include <exception>
@@ -175,16 +176,16 @@ int RunHipOga(const Options& options) {
     OgaHandle oga_handle;
     const auto model_dir = ResolveModelDir(options.model_path);
 
-    auto config = OgaConfig::Create(model_dir.string().c_str());
     const auto genai_config = ReadJsonFile(model_dir / "genai_config.json");
-    const auto overlay = flm::hip_oga::build_session_overlay(
+    const auto effective_config = flm::hip_oga::build_effective_config(
         genai_config,
         nlohmann::json{{"provider", options.provider},
                        {"profile", options.profile},
                        {"offload_policy", options.offload_policy}},
         flm::hip_oga::getenv_flag_enabled("FLM_HIP_OGA_DIAGNOSTICS"),
         flm::hip_oga::getenv_string("FLM_HIP_OGA_PROFILE_PREFIX"));
-    config->Overlay(overlay.dump().c_str());
+    flm::hip_oga::ScopedConfigDirectory config_directory(model_dir, effective_config);
+    auto config = OgaConfig::Create(config_directory.path().string().c_str());
 
     std::cerr << "FLM HIP OGA provider=" << options.provider
               << " profile=" << options.profile

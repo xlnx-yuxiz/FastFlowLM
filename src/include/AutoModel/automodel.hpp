@@ -18,6 +18,8 @@
 #include <any>
 #include "typedef.hpp"
 #include "causal_lm.hpp"
+#include "AutoModel/model_backend.hpp"
+#include "backend_options.hpp"
 #include "lm_config.hpp"
 #include "models/llama/llama_npu.hpp"
 #include "models/qwen2/qwen2_npu.hpp"
@@ -39,11 +41,14 @@
 #include "models/hunyuan/hunyuan_npu.hpp"
 #include "tokenizer/tokenizer.hpp"
 #include "modules/sampler.hpp"
+#include "sampling/request.hpp"
 #include "utils/utils.hpp"
 #include "utils/profiler.hpp"
 #include "tensor_utils/q4_npu_eXpress.hpp"
 #include "npu_utils/npu_utils.hpp"
 #include "minja/chat-template.hpp"
+#include "chat/chat_format.hpp"
+#include "chat/chat_constraint.hpp"
 #include <nlohmann/json.hpp>
 
 // Forward declaration
@@ -121,6 +126,9 @@ struct chat_meta_info_t {
     stop_reason_t stop_reason;
 	bool restore_allowed;
 	tool_choice_t tool_choice;
+	// Actual prompt tail used to initialize this request's output parser.
+	std::string prompt_tail;
+	std::shared_ptr<decode_constraint> constraint;
 
 	chat_meta_info_t() : max_prefill_len(0), prompt_tokens(0), cached_prompt_tokens(0), generated_tokens(0), total_duration(0), load_duration(0), prefill_duration(0), decoding_duration(0), stop_reason(EOT_DETECTED), restore_allowed(false), tool_choice(TOOL_CHOICE_AUTO) {}
 };
@@ -153,9 +161,16 @@ using json = nlohmann::ordered_json;
 class AutoModel {
 protected:
 	std::string model_path = "";
-	std::unique_ptr<causal_lm> lm_engine = nullptr;
+	std::unique_ptr<flm::backend::ModelBackend> backend_;
+	causal_lm* lm_engine = nullptr; // non-owning view of backend_->engine()
 	std::unique_ptr<Tokenizer> tokenizer = nullptr;
 	std::unique_ptr<Sampler> sampler = nullptr;
+	std::unique_ptr<flm::sampling::SamplingState> sampling_state_;
+	virtual bool supports_common_sampling() const { return true; }
+	void begin_sampling_turn();
+	bool common_sampling_enabled() const {
+		return sampling_state_ && sampling_state_->provider() == flm::sampling::Provider::Common;
+	}
 	std::unique_ptr<Q4NX> q4nx = nullptr;
 	bool is_model_loaded = false;
 	std::string current_model = "";
@@ -184,6 +199,7 @@ protected:
 	uint32_t total_tokens = 0;
 	std::unique_ptr<LM_Config> lm_config = nullptr;
 	std::unique_ptr<minja::chat_template> chat_tmpl = nullptr;
+	chat_format_spec chat_format;
 
 	std::string bos_token;
     std::string eos_token;
@@ -218,8 +234,15 @@ protected:
 
 
 
-	void _shared_load_model(std::string model_path, json model_info, int default_context_length = -1, bool enable_preemption = false);
+	void _release_model_state() noexcept;
+	virtual std::string backend_family(const json& model_info) const;
+	void _shared_load_backend(std::string model_path, json model_info,
+	                          int default_context_length = -1,
+	                          bool enable_preemption = false,
+	                          const std::string& requested_backend = "",
+	                          const nlohmann::json* tokenizer_config = nullptr);
 	nlohmann::json _shared_setup_tokenizer(std::string model_path);
+	void _detect_chat_format(const std::string& template_src);
 
 	/// \brief Insert tokens into the model
 	/// \param meta_info the meta information of the chat
@@ -246,7 +269,15 @@ public:
 	///        does not preserve context across turns (e.g. qwen3vl_flash).
 	bool single_turn = false;
 
-	virtual ~AutoModel() = default;
+	virtual ~AutoModel();
+
+	virtual std::string backend_id() const {
+		return is_model_loaded && backend_ ? backend_->id() : std::string{};
+	}
+	const chat_format_spec& get_chat_format() const { return chat_format; }
+	virtual std::shared_ptr<decode_constraint> make_constraint(const chat_constraint_request&) {
+		throw std::invalid_argument("Constrained output is not implemented by this backend");
+	}
 
 	AutoModel(flm_rt::device* npu_device_inst, std::string current_model = "");
 
@@ -263,6 +294,7 @@ public:
 	/// \brief Mark this instance as running under `flm serve` (vs. `flm run`)
 	/// \param value true if running under `flm serve`
 	void set_server_mode(bool value) { is_server_mode = value; }
+	void set_log_raw_output(bool value) { log_raw_output = value; }
 
 	/// \brief Get the current model
 	/// \return the current model
@@ -275,6 +307,9 @@ public:
 	/// \brief Set the sampler
 	/// \param sampler_config the sampler config
 	virtual void set_sampler(sampler_config& sampler_config);
+	// Dedicated API: model-specific configure_parameter overrides cannot swallow it.
+	virtual void set_sampling_provider(const std::string& name);
+	virtual void configure_sampling_request(const nlohmann::json& options, bool reset = true);
 
 	/// \brief Set the max length
 	/// \param MAX_L the max length
@@ -323,31 +358,31 @@ public:
 
 	/// \brief Set the topk
 	/// \param topk the topk
-	void set_topk(int topk);
+	virtual void set_topk(int topk);
 
 	/// \brief Set the topp
 	/// \param topp the topp
-	void set_topp(float topp);
+	virtual void set_topp(float topp);
 
 	/// \brief Set the minp
 	/// \param topp the minp
-	void set_minp(float minp);
+	virtual void set_minp(float minp);
 
 	/// \brief Set the temperature
 	/// \param temperature the temperature
-	void set_temperature(float temperature);
+	virtual void set_temperature(float temperature);
 
 	/// \brief Set the presencepenalty
 	/// \param presence_penalty the presence penalty
-	void set_presence_penalty(float presence_penalty);
+	virtual void set_presence_penalty(float presence_penalty);
 
 	/// \brief Set the repetition penalty
 	/// \param repetition_penalty the repetition penalty
-	void set_repetition_penalty(float repetition_penalty);
+	virtual void set_repetition_penalty(float repetition_penalty);
 
 	/// \brief Set the frequency penalty
 	/// \param frequency_penalty the frequency penalty
-	void set_frequency_penalty(float frequency_penalty);
+	virtual void set_frequency_penalty(float frequency_penalty);
 
 	/// \brief Set the frequency penalty window
 	/// \param frequency_penalty_window the frequency penalty window
@@ -412,7 +447,7 @@ public:
 
 	//************ Unique for each model *************/
 	
-	virtual void load_model(std::string model_path, json model_info, int default_context_length = -1, bool enable_preemption = false) {}
+	virtual void load_model(std::string model_path, json model_info, int default_context_length = -1, bool enable_preemption = false, const std::string& backend = "") {}
 	virtual std::string generate(chat_meta_info_t& meta_info, int length_limit, std::ostream& os, std::function<bool()> is_cancelled = [] { return false; }) = 0;
 	virtual chat_template_type_t get_chat_template_type() {
 		return chat_template_type_t::chat_ml;

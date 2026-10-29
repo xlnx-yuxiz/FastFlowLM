@@ -7,8 +7,13 @@
  *  \version 0.9.24
  */
 #include "rest_handler.hpp"
+#include "request_scope.hpp"
+#include "chat/tool_history.hpp"
+#include "chat/auto_tools.hpp"
 #include "backend_options.hpp"
 #include "hip_oga_policy.hpp"
+#include "AutoModel/hip_oga_sampling.hpp"
+#include "AutoModel/hip_oga_errors.hpp"
 #include "wstream_buf.hpp"
 #include "streaming_ostream.hpp"
 #include "streaming_ostream_openai.hpp"
@@ -420,7 +425,7 @@ static json convert_tool_responses_gemma4(json messages) {
 RestHandler::RestHandler(model_list& models, ModelDownloader& downloader, program_args_t& args)
     : supported_models(models), downloader(downloader), current_model_tag(""),
       default_model_tag(args.model_tag),
-      backend(flm::backend::normalize_backend(args.backend)),
+      backend(flm::backend::normalize_backend(args.backend)), sampler_provider(args.sampler),
       current_backend(""), modelscope(args.modelscope), asr(args.asr),
       embed(args.embed), img_pre_resize(args.img_pre_resize),
       preemption(args.preemption){
@@ -484,6 +489,18 @@ RestHandler::RestHandler(model_list& models, ModelDownloader& downloader, progra
 ///@return the rest handler
 RestHandler::~RestHandler() = default;
 
+void RestHandler::clear_cancelled_request() noexcept {
+    prompt_cache.reset();
+    model_used_for_last_message.clear();
+    try {
+        if (auto_chat_engine) auto_chat_engine->clear_context();
+    } catch (...) {
+        auto_chat_engine.reset();
+        current_model_tag.clear();
+        current_backend.clear();
+    }
+}
+
 flm_rt::device* RestHandler::ensure_npu_device() {
     if (!this->npu_device_inst) {
         this->npu_device_inst = std::make_unique<flm_rt::device>(0);
@@ -516,7 +533,13 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
     const std::string resolved_backend =
         request_backend.empty() ? this->backend
                                 : flm::backend::normalize_backend(request_backend);
-    if (current_model_tag != ensure_tag || current_backend != resolved_backend) {
+    if (!auto_chat_engine || current_model_tag != ensure_tag || current_backend != resolved_backend) {
+        // A failed replacement must never leave the old identity paired with
+        // a destroyed or only partially constructed engine.
+        current_model_tag = "model-faker";
+        current_backend.clear();
+        model_used_for_last_message.clear();
+        prompt_cache.reset();
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         if (auto_chat_engine != nullptr) {
             auto_chat_engine.reset();
@@ -567,7 +590,8 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
             report_hip_oga_offload_policy(model_info);
         }
         try {
-            auto_chat_engine->load_model(model_path, model_info, ctx_length, preemption);
+            auto_chat_engine->load_model(model_path, model_info, ctx_length, preemption, resolved_backend);
+            auto_chat_engine->set_sampling_provider(this->sampler_provider);
         }
         catch (const std::exception& e) {
             header_print("ERROR", "Failed to load model: " + std::string(e.what()));
@@ -659,34 +683,8 @@ void RestHandler::ensure_embed_model_loaded(const std::string& model_tag) {
 ///@param options the options JSON object
 ///@param request the request JSON object
 void RestHandler::configure_chat_engine_parameters(const json& options, const json& request) {
-    if (request.contains("temperature")) {
-        float temperature = request["temperature"];
-        auto_chat_engine->set_temperature(temperature);
-    }
-    if (request.contains("top_p")) {
-        float top_p = request["top_p"];
-        auto_chat_engine->set_topp(top_p);
-    }
-    if (request.contains("top_k")) {
-        int top_k = request["top_k"];
-        auto_chat_engine->set_topk(top_k);
-    }
-    if (request.contains("min_p")) {
-        int min_p = request["min_p"];
-        auto_chat_engine->set_minp(min_p);
-    }
-    if (request.contains("presence_penalty")) {
-        float presence_penalty = request["presence_penalty"];
-        auto_chat_engine->set_presence_penalty(presence_penalty);
-    }
-    if (request.contains("frequency_penalty")) {
-        float frequency_penalty = request["frequency_penalty"];
-        auto_chat_engine->set_frequency_penalty(frequency_penalty);
-    }
-    if (request.contains("repetition_penalty")) {
-        float repetition_penalty = request["repetition_penalty"];
-        auto_chat_engine->set_repetition_penalty(repetition_penalty);
-    }
+    const nlohmann::json sampling = flm::sampling::normalize_sampling_request(options, request);
+    auto_chat_engine->configure_sampling_request(sampling);
     if (request.contains("think")) {
         bool enable_thinking = request["think"];
         auto_chat_engine->configure_parameter("enable_think", enable_thinking);
@@ -814,6 +812,13 @@ void RestHandler::handle_generate(const json& request,
                                  std::function<void(const json&)> send_response,
                                  StreamResponseCallback send_streaming_response,
                                  std::shared_ptr<CancellationToken> cancellation_token) {
+    const auto request_cancelled = [&] { return cancellation_token && cancellation_token->cancelled(); };
+    flm::server::RequestScope cleanup_request([&] {
+        if (request_cancelled()) clear_cancelled_request();
+    });
+    // Other endpoint formats cannot leave OpenAI prompt-cache metadata valid.
+    prompt_cache.reset();
+    model_used_for_last_message.clear();
     try {
         std::string prompt = request["prompt"];
         bool stream = request.value("stream", true);
@@ -830,6 +835,7 @@ void RestHandler::handle_generate(const json& request,
             return;
         }
         auto load_end_time = time_utils::now();
+        configure_chat_engine_parameters(options, request);
 
         chat_meta_info_t meta_info;
         lm_uniform_input_t uniformed_input;
@@ -844,8 +850,8 @@ void RestHandler::handle_generate(const json& request,
             uniformed_input.prompt = prompt;
             try {
                 configure_hip_oga_requested_max_tokens(auto_chat_engine.get(), length_limit);
-                bool success = auto_chat_engine->insert(meta_info, uniformed_input);
-                if (!success){
+                bool success = auto_chat_engine->insert(meta_info, uniformed_input, request_cancelled);
+                if (!success && !request_cancelled()){
                     json error_response = {{"error", "Max length reached"}};
                     send_response(error_response);
                     this->auto_chat_engine->clear_context();
@@ -858,7 +864,8 @@ void RestHandler::handle_generate(const json& request,
                 return;
             }
             try {
-                auto_chat_engine->generate(meta_info, length_limit, ostream);
+                if (request_cancelled()) meta_info.stop_reason = CANCEL_DETECTED;
+                else auto_chat_engine->generate(meta_info, length_limit, ostream, request_cancelled);
             } catch (const std::exception& e) {
                 json error_response = {{"error", e.what()}};
                 send_response(error_response);
@@ -878,8 +885,8 @@ void RestHandler::handle_generate(const json& request,
             uniformed_input.prompt = prompt;
             try {
                 configure_hip_oga_requested_max_tokens(auto_chat_engine.get(), length_limit);
-                bool success = auto_chat_engine->insert(meta_info, uniformed_input);
-                if (!success){
+                bool success = auto_chat_engine->insert(meta_info, uniformed_input, request_cancelled);
+                if (!success && !request_cancelled()){
                     json error_response = {{"error", "Max length reached"}};
                     send_response(error_response);
                     this->auto_chat_engine->clear_context();
@@ -892,7 +899,8 @@ void RestHandler::handle_generate(const json& request,
                 return;
             }
             try {
-                auto_chat_engine->generate(meta_info, length_limit, ostream);
+                if (request_cancelled()) meta_info.stop_reason = CANCEL_DETECTED;
+                else auto_chat_engine->generate(meta_info, length_limit, ostream, request_cancelled);
             } catch (const std::exception& e) {
                 json error_response = {{"error", e.what()}};
                 send_response(error_response);
@@ -917,6 +925,8 @@ void RestHandler::handle_generate(const json& request,
             // std::cout << "history: " << history.first << std::endl;
             send_response(response);
         }
+    } catch (const flm::hip_oga::SamplingRequestError& e) {
+        send_response(build_openai_error_response(e.what(), "invalid_request_error", 400));
     } catch (const std::exception& e) {
         json error_response = {{"error", e.what()}};
         send_response(error_response);
@@ -931,6 +941,13 @@ void RestHandler::handle_chat(const json& request,
                              std::function<void(const json&)> send_response,
                              StreamResponseCallback send_streaming_response,
                              std::shared_ptr<CancellationToken> cancellation_token) {
+    const auto request_cancelled = [&] { return cancellation_token && cancellation_token->cancelled(); };
+    flm::server::RequestScope cleanup_request([&] {
+        if (request_cancelled()) clear_cancelled_request();
+    });
+    // Other endpoint formats cannot leave OpenAI prompt-cache metadata valid.
+    prompt_cache.reset();
+    model_used_for_last_message.clear();
     try {
         nlohmann::ordered_json messages = request["messages"];
         bool stream = request.value("stream", false);
@@ -963,8 +980,8 @@ void RestHandler::handle_chat(const json& request,
             uniformed_input.messages = messages;
             try {
                 configure_hip_oga_requested_max_tokens(auto_chat_engine.get(), length_limit);
-                bool success = auto_chat_engine->insert(meta_info, uniformed_input);
-                if (!success){
+                bool success = auto_chat_engine->insert(meta_info, uniformed_input, request_cancelled);
+                if (!success && !request_cancelled()){
                     json error_response = {{"error", "Max length reached"}};
                     send_response(error_response);
                     this->auto_chat_engine->clear_context();
@@ -977,7 +994,8 @@ void RestHandler::handle_chat(const json& request,
                 return;
             }
             try {
-                auto_chat_engine->generate(meta_info, length_limit, ostream);
+                if (request_cancelled()) meta_info.stop_reason = CANCEL_DETECTED;
+                else auto_chat_engine->generate(meta_info, length_limit, ostream, request_cancelled);
             } catch (const std::exception& e) {
                 json error_response = {{"error", e.what()}};
                 send_response(error_response);
@@ -1000,7 +1018,12 @@ void RestHandler::handle_chat(const json& request,
             std::string response_text;
             try {
                 configure_hip_oga_requested_max_tokens(auto_chat_engine.get(), length_limit);
-                response_text = auto_chat_engine->generate_with_prompt(meta_info, uniformed_input, length_limit, nstream);
+                if (auto_chat_engine->insert(meta_info, uniformed_input, request_cancelled)) {
+                    if (!request_cancelled()) {
+                        response_text = auto_chat_engine->generate(meta_info, length_limit, nstream, request_cancelled);
+                    }
+                }
+                if (request_cancelled()) meta_info.stop_reason = CANCEL_DETECTED;
             } catch (const std::exception& e) {
                 json error_response = {{"error", e.what()}};
                 send_response(error_response);
@@ -1033,6 +1056,8 @@ void RestHandler::handle_chat(const json& request,
             // std::cout << "history: " << history.first << std::endl;
             this->auto_chat_engine->clear_context();
         }
+    } catch (const flm::hip_oga::SamplingRequestError& e) {
+        send_response(build_openai_error_response(e.what(), "invalid_request_error", 400));
     } catch (const std::exception& e) {
         json error_response = {{"error", e.what()}};
         send_response(error_response);
@@ -1047,6 +1072,14 @@ void RestHandler::handle_embeddings(const json& request,
                                    std::function<void(const json&)> send_response,
                                    StreamResponseCallback send_streaming_response) {
     try {
+        if (flm::backend::is_hip_oga_backend(this->backend)) {
+            send_response({{"error", {
+                {"message", "Sentence embeddings are not supported by backend=hip."},
+                {"type", "unsupported_feature"},
+                {"code", 501}
+            }}});
+            return;
+        }
         std::string model = request["model"];
         std::vector<std::string> inputs;
 
@@ -1276,7 +1309,10 @@ void RestHandler::handle_openai_chat_completion(const json& request,
                                                std::function<void(const json&)> send_response,
                                                StreamResponseCallback send_streaming_response,
                                                std::shared_ptr<CancellationToken> cancellation_token) {
-    static std::string model_used_for_last_message = "model-faker";
+    const auto request_cancelled = [&] { return cancellation_token && cancellation_token->cancelled(); };
+    flm::server::RequestScope cleanup_request([&] {
+        if (request_cancelled()) clear_cancelled_request();
+    });
     try {
         // Extract OpenAI-style parameters
         json current_messages = request["messages"];
@@ -1287,40 +1323,40 @@ void RestHandler::handle_openai_chat_completion(const json& request,
         json tools = request.value("tools", json::array());
         json options = request.value("options", json::object());
 
-        // Only tool_choice=auto and tool_choice=none are supported today.
-        // Reject "required" and per-function object choices explicitly so
-        // clients do not mistake a best-effort fallback for a guaranteed tool
-        // routing mode.
-        json tool_choice = request.value("tool_choice", json("auto"));
-        tool_choice_t tool_choice_mode = TOOL_CHOICE_AUTO;
-        if (tool_choice.is_string()) {
-            const std::string tool_choice_value = tool_choice.get<std::string>();
-            if (tool_choice_value == "none") {
-                tool_choice_mode = TOOL_CHOICE_NONE;
-            }
-            else if (tool_choice_value != "auto") {
-                send_response(build_openai_error_response(
-                    "Unsupported tool_choice for FastFlowLM OpenAI chat completions: " +
-                        tool_choice.dump() + ". Supported values are \"auto\" and \"none\".",
-                    "unsupported_request_error",
-                    400));
-                return;
-            }
-        }
-        else {
-            send_response(build_openai_error_response(
-                "Unsupported tool_choice for FastFlowLM OpenAI chat completions: " +
-                    tool_choice.dump() + ". Supported values are \"auto\" and \"none\".",
-                "unsupported_request_error",
-                400));
+        chat_constraint_request constraint_request;
+        std::string constraint_error;
+        if (!chat_constraint_request_from_openai(request, tools, constraint_request, constraint_error)) {
+            send_response(build_openai_error_response(constraint_error, "invalid_request_error", 400));
             return;
         }
+        const auto tool_choice_mode = constraint_request.tool_choice == chat_tool_choice::NONE
+            ? TOOL_CHOICE_NONE : TOOL_CHOICE_AUTO;
+        const bool needs_constraint = constraint_request.json_object || !constraint_request.json_schema.is_null() ||
+            constraint_request.structured_auto ||
+            constraint_request.tool_choice == chat_tool_choice::REQUIRED ||
+            constraint_request.tool_choice == chat_tool_choice::FUNCTION ||
+            (!tools.empty() && request.contains("parallel_tool_calls") && !constraint_request.parallel_tool_calls);
+        const bool json_content = constraint_request.json_object || !constraint_request.json_schema.is_null();
+
         json tools_for_template =
             tool_choice_mode == TOOL_CHOICE_NONE ? json::array() : tools;
 
         const std::string resolved_backend =
             request_backend.empty() ? this->backend
                                     : flm::backend::normalize_backend(request_backend);
+        const bool using_hip_oga_backend = flm::backend::is_hip_oga_backend(resolved_backend);
+        // Reject an unsupported constraint before changing the loaded model or
+        // initializing a device merely to report that the request is invalid.
+        if (needs_constraint && !using_hip_oga_backend) {
+            send_response(build_openai_error_response("Constrained output is not implemented by this backend",
+                                                     "unsupported_request_error", 400));
+            return;
+        }
+        if (flm::backend::is_hip_oga_backend(resolved_backend) &&
+            !flm::chat::normalize_openai_tool_history(current_messages, constraint_error)) {
+            send_response(build_openai_error_response(constraint_error, "invalid_request_error", 400));
+            return;
+        }
         try {
             current_messages = normalize_messages(current_messages);
             current_messages = normalize_template(current_messages, flm::backend::is_hip_oga_backend(resolved_backend));
@@ -1338,8 +1374,7 @@ void RestHandler::handle_openai_chat_completion(const json& request,
 
         auto load_start_time = time_utils::now();
         if (!ensure_model_loaded(model, request_backend)) {
-            json error_response = {{"error", "Failed to load " + model + " model!"}};
-            send_response(error_response);
+            send_response(build_openai_error_response("Failed to load " + model + " model!", "model_error", 500));
             return;
         }
         auto load_end_time = time_utils::now();
@@ -1348,8 +1383,15 @@ void RestHandler::handle_openai_chat_completion(const json& request,
 
         // see if we can use prompt cache
         chat_meta_info_t meta_info;
-        const bool using_hip_oga_backend =
-            flm::backend::is_hip_oga_backend(resolved_backend);
+        if (needs_constraint) {
+            try {
+                meta_info.constraint = auto_chat_engine->make_constraint(constraint_request);
+                if (!meta_info.constraint) throw std::invalid_argument("This model cannot enforce the requested constraint");
+            } catch (const std::invalid_argument& error) {
+                send_response(build_openai_error_response(error.what(), "invalid_request_error", 400));
+                return;
+            }
+        }
         const bool hip_oga_prefix_cache_enabled =
             hip_oga_prefix_cache_experimental_enabled();
         const bool hip_oga_media_request =
@@ -1382,11 +1424,11 @@ void RestHandler::handle_openai_chat_completion(const json& request,
             auto_chat_engine->clear_context();
         }
         else if (hip_oga_media_request) {
+            // Eligibility only: the backend compares actual processor tokens,
+            // image bytes and layout before restoring its own checkpoint.
             this->prompt_cache.reset();
             model_used_for_last_message = model;
-            meta_info.restore_allowed = false;
-            header_print("FLM", "HIP OGA prefix cache fallback: multimodal_forced_miss.");
-            auto_chat_engine->clear_context();
+            meta_info.restore_allowed = true;
         }
         else if (model != model_used_for_last_message) { // switch models will clear context
             this->prompt_cache.update_message_checksum(current_messages);
@@ -1421,12 +1463,25 @@ void RestHandler::handle_openai_chat_completion(const json& request,
         lm_uniform_input_t uniformed_input;
         uniformed_input.messages = current_messages;
         uniformed_input.tools = tools_for_template;
+        if (constraint_request.structured_auto) {
+            if (normalized_messages_have_media(current_messages)) {
+                send_response(build_openai_error_response("Structured tool routing supports text only",
+                                                         "invalid_request_error", 400));
+                return;
+            }
+            try {
+                uniformed_input.messages = chat_prepare_auto_tools(current_messages, tools_for_template);
+            } catch (const std::invalid_argument& error) {
+                send_response(build_openai_error_response(error.what(), "invalid_request_error", 400));
+                return;
+            }
+            uniformed_input.tools = json::array();
+        }
         meta_info.load_duration = (uint64_t)time_utils::duration_ns(load_start_time, load_end_time).first;
         meta_info.max_prefill_len = this->prefill_chunk_len;
         meta_info.tool_choice = tool_choice_mode;
         if (stream){
             // Create a wrapper callback that passes the pre-formatted SSE string directly
-            cancellation_token->reset();
             auto_chat_engine->reset_parser();
             auto openai_stream_callback = [&send_streaming_response](const std::string& data, bool is_final) {
                 json data_json = data;
@@ -1435,7 +1490,9 @@ void RestHandler::handle_openai_chat_completion(const json& request,
             const bool allow_tool_calls =
                 !(flm::backend::is_hip_oga_backend(this->current_backend) &&
                   tools_for_template.empty());
-            streaming_ostream_openai_chat ostream(model, auto_chat_engine.get(), openai_stream_callback, allow_tool_calls);  // streaming in chat completion format
+            streaming_ostream_openai_chat ostream(model, auto_chat_engine.get(), openai_stream_callback,
+                                                  allow_tool_calls, tools_for_template, using_hip_oga_backend, json_content,
+                                                  constraint_request.structured_auto);
 
             header_print("FLM", "Start prefill...");
             try {
@@ -1444,9 +1501,9 @@ void RestHandler::handle_openai_chat_completion(const json& request,
                                           options,
                                           request,
                                           tool_choice_mode);
-                bool success = auto_chat_engine->insert(meta_info, uniformed_input, [&] { return cancellation_token->cancelled(); });
+                bool success = auto_chat_engine->insert(meta_info, uniformed_input, request_cancelled);
                 if (!success) {
-                    if (meta_info.stop_reason == CANCEL_DETECTED || cancellation_token->cancelled()) {
+                    if (meta_info.stop_reason == CANCEL_DETECTED || request_cancelled()) {
                         meta_info.stop_reason = CANCEL_DETECTED;
                         header_print("❌ ", "Prefill Cancelled!");
                         ostream.finalize(meta_info);
@@ -1471,15 +1528,17 @@ void RestHandler::handle_openai_chat_completion(const json& request,
                 if (using_hip_oga_backend) {
                     disable_hip_oga_prefix_cache_for_session(auto_chat_engine.get(), e.what());
                 }
-                json error_response = {{"error", e.what()}};
-                send_response(error_response);
+                send_response(using_hip_oga_backend
+                    ? flm::hip_oga::prefill_error_response(e)
+                    : json{{"error", e.what()}});
                 this->auto_chat_engine->clear_context();
                 this->prompt_cache.reset();
                 return;
             }
             header_print("FLM", "Start generating...");
             try {
-                auto_chat_engine->generate(meta_info, length_limit, ostream, [&] { return cancellation_token->cancelled(); });
+                ostream.start(meta_info);
+                auto_chat_engine->generate(meta_info, length_limit, ostream, request_cancelled);
             } catch (const std::exception& e) {
                 if (using_hip_oga_backend) {
                     disable_hip_oga_prefix_cache_for_session(auto_chat_engine.get(), e.what());
@@ -1495,7 +1554,12 @@ void RestHandler::handle_openai_chat_completion(const json& request,
                 this->prompt_cache.reset();
             }
 
+            if (constraint_request.structured_auto && request_cancelled()) meta_info.stop_reason = CANCEL_DETECTED;
             ostream.finalize(meta_info);
+            if (meta_info.stop_reason == ERROR_DETECTED) {
+                this->auto_chat_engine->clear_context();
+                this->prompt_cache.reset();
+            }
         }
         else {
             nullstream nstream;
@@ -1508,12 +1572,20 @@ void RestHandler::handle_openai_chat_completion(const json& request,
                                           options,
                                           request,
                                           tool_choice_mode);
-                bool success = auto_chat_engine->insert(meta_info, uniformed_input, [&] { return cancellation_token->cancelled(); });
+                bool success = auto_chat_engine->insert(meta_info, uniformed_input, request_cancelled);
                 if (!success) {
-                    if (meta_info.stop_reason == CANCEL_DETECTED || cancellation_token->cancelled()) {
+                    if (meta_info.stop_reason == CANCEL_DETECTED || request_cancelled()) {
                         meta_info.stop_reason = CANCEL_DETECTED;
                         header_print("❌ ", "Prefill Cancelled!");
-                        send_response(response);
+                        send_response(json{
+                            {"id", "fastflowlm-chat-completion"}, {"object", "chat.completion"},
+                            {"created", static_cast<long long>(std::time(nullptr))}, {"model", model},
+                            {"choices", json::array({{{"index", 0},
+                                {"message", {{"role", "assistant"}, {"content", ""}}},
+                                {"finish_reason", "cancel"}}})},
+                            {"usage", {{"prompt_tokens", meta_info.prompt_tokens},
+                                       {"completion_tokens", 0}, {"total_tokens", meta_info.prompt_tokens}}}
+                        });
                         this->auto_chat_engine->clear_context();
                         this->prompt_cache.reset();
                         return;
@@ -1534,15 +1606,16 @@ void RestHandler::handle_openai_chat_completion(const json& request,
                 if (using_hip_oga_backend) {
                     disable_hip_oga_prefix_cache_for_session(auto_chat_engine.get(), e.what());
                 }
-                json error_response = {{"error", e.what()}};
-                send_response(error_response);
+                send_response(using_hip_oga_backend
+                    ? flm::hip_oga::prefill_error_response(e)
+                    : json{{"error", e.what()}});
                 this->auto_chat_engine->clear_context();
                 this->prompt_cache.reset();
                 return;
             }
             header_print("FLM", "Start generating...");
             try {
-                response_text = auto_chat_engine->generate(meta_info, length_limit, nstream, [&] { return cancellation_token->cancelled(); });
+                response_text = auto_chat_engine->generate(meta_info, length_limit, nstream, request_cancelled);
             } catch (const std::exception& e) {
                 if (using_hip_oga_backend) {
                     disable_hip_oga_prefix_cache_for_session(auto_chat_engine.get(), e.what());
@@ -1553,23 +1626,24 @@ void RestHandler::handle_openai_chat_completion(const json& request,
                 this->prompt_cache.reset();
                 return;
             }
-            NonStreamResult parsed_response =
-                auto_chat_engine->parse_nstream_content(response_text);
+            const auto& format = auto_chat_engine->get_chat_format();
+            chat_output output(format, chat_format_prefill(format, meta_info.prompt_tail),
+                               tools_for_template, using_hip_oga_backend,
+                               !using_hip_oga_backend || !tools_for_template.empty(), json_content,
+                               constraint_request.structured_auto);
+            if (constraint_request.structured_auto && request_cancelled()) meta_info.stop_reason = CANCEL_DETECTED;
+            const auto parsed = constraint_request.structured_auto && meta_info.stop_reason == CANCEL_DETECTED
+                ? chat_output_result{} : output.update(response_text, true);
+            NonStreamResult parsed_response;
+            parsed_response.content = parsed.message.content;
+            parsed_response.reasoning_content = parsed.message.reasoning;
+            parsed_response.error_message = parsed.error;
+            for (const auto& call : parsed.message.tool_calls) {
+                parsed_response.tool_calls_list.emplace_back(call.name, call.arguments);
+            }
             if (!parsed_response.error_message.empty()) {
                 send_response(build_openai_error_response(
                     parsed_response.error_message,
-                    "model_output_error",
-                    422));
-                this->auto_chat_engine->clear_context();
-                this->prompt_cache.reset();
-                return;
-            }
-            if (flm::backend::is_hip_oga_backend(this->current_backend) &&
-                tools_for_template.empty() &&
-                (!parsed_response.tool_calls_list.empty() ||
-                 !parsed_response.tool_name.empty())) {
-                send_response(build_openai_error_response(
-                    "HIP OGA model emitted a tool call even though no tools were enabled for this request.",
                     "model_output_error",
                     422));
                 this->auto_chat_engine->clear_context();
@@ -1604,6 +1678,8 @@ void RestHandler::handle_openai_chat_completion(const json& request,
             send_response(response);
         }
 
+    } catch (const flm::hip_oga::SamplingRequestError& e) {
+        send_response(build_openai_error_response(e.what(), "invalid_request_error", 400));
     } catch (const std::exception& e) {
         json error_response = {
             {"error", {
@@ -1687,6 +1763,13 @@ void RestHandler::handle_openai_completion(const json& request,
     std::function<void(const json&)> send_response,
     StreamResponseCallback send_streaming_response,
     std::shared_ptr<CancellationToken> cancellation_token) {
+    const auto request_cancelled = [&] { return cancellation_token && cancellation_token->cancelled(); };
+    flm::server::RequestScope cleanup_request([&] {
+        if (request_cancelled()) clear_cancelled_request();
+    });
+    // Other endpoint formats cannot leave OpenAI prompt-cache metadata valid.
+    prompt_cache.reset();
+    model_used_for_last_message.clear();
     try {
         // Extract OpenAI-style parameters
         std::string prompt = request["prompt"];
@@ -1732,8 +1815,8 @@ void RestHandler::handle_openai_completion(const json& request,
             uniformed_input.prompt = prompt;
             try {
                 configure_hip_oga_requested_max_tokens(auto_chat_engine.get(), length_limit);
-                bool success = auto_chat_engine->insert(meta_info, uniformed_input);
-                if (!success) {
+                bool success = auto_chat_engine->insert(meta_info, uniformed_input, request_cancelled);
+                if (!success && !request_cancelled()) {
                     json error_response = { {"error", "Max length reached"} };
                     send_response(error_response);
                     this->auto_chat_engine->clear_context();
@@ -1746,7 +1829,8 @@ void RestHandler::handle_openai_completion(const json& request,
                 return;
             }
             try {
-                auto_chat_engine->generate(meta_info, length_limit, ostream);
+                if (request_cancelled()) meta_info.stop_reason = CANCEL_DETECTED;
+                else auto_chat_engine->generate(meta_info, length_limit, ostream, request_cancelled);
             } catch (const std::exception& e) {
                 json error_response = {{"error", e.what()}};
                 send_response(error_response);
@@ -1764,8 +1848,8 @@ void RestHandler::handle_openai_completion(const json& request,
             uniformed_input.prompt = prompt;
             try {
                 configure_hip_oga_requested_max_tokens(auto_chat_engine.get(), length_limit);
-                bool success = auto_chat_engine->insert(meta_info, uniformed_input);
-                if (!success) {
+                bool success = auto_chat_engine->insert(meta_info, uniformed_input, request_cancelled);
+                if (!success && !request_cancelled()) {
                     json error_response = { {"error", "Max length reached"} };
                     send_response(error_response);
                     this->auto_chat_engine->clear_context();
@@ -1778,7 +1862,8 @@ void RestHandler::handle_openai_completion(const json& request,
                 return;
             }
             try {
-                auto_chat_engine->generate(meta_info, length_limit, ostream);
+                if (request_cancelled()) meta_info.stop_reason = CANCEL_DETECTED;
+                else auto_chat_engine->generate(meta_info, length_limit, ostream, request_cancelled);
             } catch (const std::exception& e) {
                 json error_response = {{"error", e.what()}};
                 send_response(error_response);
@@ -1810,8 +1895,9 @@ void RestHandler::handle_openai_completion(const json& request,
             };
             send_response(response);
         }
-    }
-    catch (const std::exception& e) {
+    } catch (const flm::hip_oga::SamplingRequestError& e) {
+        send_response(build_openai_error_response(e.what(), "invalid_request_error", 400));
+    } catch (const std::exception& e) {
         json error_response = {
             {"error", {
                 {"message", e.what()},
