@@ -630,6 +630,8 @@ int main(int argc, char* argv[]) {
             throw std::invalid_argument("HIP codec options require --backend hip");
         }
         if (using_hip_oga) {
+            flm::hip_oga::validate_prefix_cache_options(parsed_args.prefix_cache_mb,
+                parsed_args.prefix_slots, parsed_args.prefix_min_gain);
             flm::hip_oga::apply_text_codec_cli_options(parsed_args.hip_oga_text_codec,
                 parsed_args.hip_oga_tokenizer, parsed_args.hip_oga_decoder);
         }
@@ -767,7 +769,8 @@ int main(int argc, char* argv[]) {
                 {"backend", flm::backend::kHipOgaBackendId},
                 {"default_direct_offload_policy", direct_policy},
                 {"npu_stack_check", "skipped"},
-                {"ready", true}
+                {"status", "not_checked"},
+                {"ready", nullptr}
             };
             const std::string warning = flm::hip_oga::policy_warning(direct_policy);
             if (!warning.empty()) {
@@ -775,13 +778,13 @@ int main(int argc, char* argv[]) {
             }
             std::cout << validation_json.dump(4) << std::endl;
         } else {
-            header_print("FLM", "HIP OGA backend selected; skipping NPU stack validation. Direct OGA offload_policy=" << direct_policy);
+            header_print("FLM", "HIP OGA validation not checked: GPU and runtime readiness have not been verified. Direct OGA offload_policy=" << direct_policy);
             const std::string warning = flm::hip_oga::policy_warning(direct_policy);
             if (!warning.empty()) {
                 header_print("WARNING", warning);
             }
         }
-        return 0;
+        return 2;
     }
 
     if (parsed_args.command == "validate") {

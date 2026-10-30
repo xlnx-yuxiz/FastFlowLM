@@ -275,8 +275,8 @@ namespace {
 constexpr std::uint32_t kDefaultRequestedMaxTokens = 4096;
 constexpr std::uint32_t kHipOgaSharedGenerateLookaheadTokens = 1;
 
-bool hip_oga_prefix_cache_enabled() {
-    return flm::hip_oga::prefix_cache_env_enabled(
+bool hip_oga_prefix_cache_enabled(int slots) {
+    return flm::hip_oga::prefix_cache_enabled(slots,
         std::getenv("FLM_HIP_OGA_PREFIX_CACHE"));
 }
 
@@ -1472,6 +1472,8 @@ void HipOgaModel::load_model(std::string model_path,
                              int default_context_length,
                              bool enable_preemption,
                              const std::string& backend) {
+    flm::hip_oga::validate_prefix_cache_options(
+        this->prefix_cache_mb_arg_, this->prefix_slots_arg_, this->prefix_min_gain_arg_);
     auto& registry = flm::backend::BackendRegistry::instance();
     const std::string family = flm::backend::hip_oga_backend_family(
         registry, model_info.value("details", json::object()).value("family", "hip-oga"));
@@ -1722,14 +1724,14 @@ bool HipOgaModel::insert(chat_meta_info_t& meta_info,
             prefix_cache_.reset_checkpoint("seeded_sampling_rng_reset");
         }
         auto cache_decision = prefix_cache_.evaluate(
-            hip_oga_prefix_cache_enabled(),
+            hip_oga_prefix_cache_enabled(this->prefix_slots_arg_),
             meta_info.restore_allowed,
             true,
             signature,
             required_capacity,
             hip_engine->generator_capacity(),
             tokens);
-        if (reset_sampling_rng && hip_oga_prefix_cache_enabled() && meta_info.restore_allowed) {
+        if (reset_sampling_rng && hip_oga_prefix_cache_enabled(this->prefix_slots_arg_) && meta_info.restore_allowed) {
             cache_decision.reason = "seeded_sampling_rng_reset";
         }
 
@@ -1765,8 +1767,12 @@ bool HipOgaModel::insert(chat_meta_info_t& meta_info,
         meta_info.cached_prompt_tokens = static_cast<int>(cache_decision.cached_tokens);
         meta_info.prefill_duration =
             (uint64_t)time_utils::duration_ns(prefill_start_time, prefill_end_time).first;
-        prefix_cache_.commit_checkpoint(this->token_history, signature,
-                                        hip_engine->generator_capacity());
+        if (hip_oga_prefix_cache_enabled(this->prefix_slots_arg_)) {
+            prefix_cache_.commit_checkpoint(this->token_history, signature,
+                                            hip_engine->generator_capacity());
+        } else {
+            prefix_cache_.reset_checkpoint("disabled");
+        }
         header_print("FLM", "HIP OGA prefix cache attempted=" +
             std::string(cache_decision.attempted ? "1" : "0") +
             " hit=" + std::string(cache_decision.reuse ? "1" : "0") +
@@ -1781,7 +1787,7 @@ bool HipOgaModel::insert(chat_meta_info_t& meta_info,
             meta_info.stop_reason = CANCEL_DETECTED;
             return false;
         }
-        const bool cache_enabled = hip_oga_prefix_cache_enabled();
+        const bool cache_enabled = hip_oga_prefix_cache_enabled(this->prefix_slots_arg_);
         auto prepared = hip_engine->prepare_multimodal_turn(templated_text, images,
             cache_enabled);
         if (flm::hip_oga::getenv_flag_enabled("FLM_HIP_OGA_DIAGNOSTICS") &&

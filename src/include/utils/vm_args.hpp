@@ -19,11 +19,12 @@ namespace arg_utils {
 
 namespace po = boost::program_options;
 
-inline void print_help(po::options_description& general) {
+inline void print_help(po::options_description& general,
+                       const po::options_description* advanced = nullptr) {
     std::cout << "Usage: flm <command> [options] [model_tag]" << std::endl;
     std::cout << std::endl;
     std::cout << "Commands:" << std::endl;
-    std::cout << "  run <model_tag>     - Run the model interactively" << std::endl;
+    std::cout << "  run <model_tag>     - Run interactively, or once with --prompt" << std::endl;
     std::cout << "  serve <model_tag>   - Start the  server" << std::endl;
     std::cout << "  pull <model_tag>    - Download model files if not present" << std::endl;
     std::cout << "  remove <model_tag>  - Remove a model" << std::endl;
@@ -32,9 +33,11 @@ inline void print_help(po::options_description& general) {
     std::cout << "  version             - Show version information" << std::endl;
     std::cout << "  help                - Show this help message" << std::endl;
     std::cout << "  port                - Show the default server port" << std::endl;
-    std::cout << "  validate            - Validate the NPU stack" << std::endl;
+    std::cout << "  validate            - Validate the backend (HIP: not checked yet)" << std::endl;
     std::cout << std::endl;
     std::cout << general << std::endl;
+    if (advanced) std::cout << *advanced << std::endl;
+    else std::cout << "Use --help-all for advanced codec, sampling and demo options." << std::endl;
     std::cout << "Examples:" << std::endl;
     std::cout << "\tflm run llama3.2:1b" << std::endl;
     std::cout << "\tflm run llama3.2:1b --asr 1" << std::endl;
@@ -44,7 +47,7 @@ inline void print_help(po::options_description& general) {
     std::cout << "\tflm pull llama3.2:1b --modelscope 1" << std::endl;
     std::cout << "\tflm check llama3.2:1b" << std::endl;
     std::cout << "\tflm serve llama3.2:1b --ctx-len 8192" << std::endl;
-    std::cout << "\tflm run phi4-mini-it:4b --backend flm_npu" << std::endl;
+    std::cout << "\tflm run phi4-mini-it:4b --backend flm" << std::endl;
     std::cout << "\tflm serve llama3.2:1b --prefill-chunk-len 8192" << std::endl;
     std::cout << "\tflm serve qwen3.5:2b --prefix-slots 16 --prefix-cache-mb 4096" << std::endl;
     std::cout << "\tflm serve qwen3.5:2b --prefix-min-gain 256" << std::endl;
@@ -56,6 +59,8 @@ inline void print_help(po::options_description& general) {
     std::cout << "\tflm serve llama3.2:1b --embed 1" << std::endl;
     std::cout << "\tflm serve llama3.2:1b --modelscope 1" << std::endl;
     std::cout << "\tflm serve qwen3vl-it:4b --img-pre-resize 1" << std::endl;
+    std::cout << "\tflm run gemma3:4b --backend hip" << std::endl;
+    std::cout << "\tflm list --backend hip" << std::endl;
     std::cout << "\tflm list" << std::endl;
     std::cout << "\tflm list --quiet" << std::endl;
     std::cout << "\tflm list --filter installed" << std::endl;
@@ -74,6 +79,7 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
         po::options_description general("Allowed options");
         general.add_options()
             ("help,h", "Show help message")
+            ("help-all", "Include advanced codec, sampling and demo options")
             ("version,v", "Show version information")
             ("pmode", po::value<std::string>(&parsed_args.power_mode)->default_value("performance"),
              "Set power mode: powersaver, balanced, performance, turbo")
@@ -100,24 +106,18 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
             ("ctx-len,c", po::value<int>(&parsed_args.ctx_length)->default_value(-1),
              "Set context length")
             ("backend", po::value<std::string>(&parsed_args.backend)->default_value(""),
-             "Execution backend (default: the model catalog). Overrides FLM_BACKEND; npu aliases flm; hip requires FLM_ENABLE_HIP_OGA")
+             "Execution backend: flm (alias npu), core, hip. Default: model catalog; overrides FLM_BACKEND")
             ("hip-oga-text-codec", po::value<std::string>(&parsed_args.hip_oga_text_codec),
-             "HIP text tokenizer and decoder: oga (default), flm, compare, external (legacy checked FLM)")
-            ("sampler", po::value<std::string>(&parsed_args.sampler)->default_value("backend"),
-             "Sampling provider for run/serve: backend (compatibility default) or common (CPU reference)")
-            ("hip-oga-tokenizer", po::value<std::string>(&parsed_args.hip_oga_tokenizer),
-             "Override HIP text tokenizer: oga, flm, compare, external (legacy)")
-            ("hip-oga-decoder", po::value<std::string>(&parsed_args.hip_oga_decoder),
-             "Override HIP text decoder: oga, flm, compare, external (legacy)")
+             "HIP text tokenizer and decoder: oga (default), flm, compare")
             ("prefill-chunk-len,pcl", po::value<int>(&parsed_args.prefill_chunk_len)->default_value(-1),
              "Set prefill chunk length")
             ("prefix-cache-mb", po::value<int>(&parsed_args.prefix_cache_mb)->default_value(-1),
-             "Host memory in MiB for saved prompt snapshots (prefix cache), -1: default 4096 (Qwen3.5 and Qwen3.6-MoE)")
+             "Host memory in MiB for saved prompt snapshots (prefix cache), -1: default 4096 (Qwen3.5 and Qwen3.6-MoE). HIP: unsupported")
             ("prefix-slots", po::value<int>(&parsed_args.prefix_slots)->default_value(-1),
-             "How many prompt snapshots to keep (prefix cache), -1: default 8, at most 32, 0: off (Qwen3.5 and Qwen3.6-MoE)")
+             "How many prompt snapshots to keep (prefix cache), -1: default 8, at most 32, 0: off (Qwen3.5 and Qwen3.6-MoE). HIP: 0 off, 1 experimental live-generator reuse, -1 legacy env opt-in")
             ("prefix-min-gain", po::value<int>(&parsed_args.prefix_min_gain)->default_value(-1),
              "Prefix cache: a new end-of-prompt snapshot is only saved if it adds at least this many tokens over a saved one that already covers the prompt, "
-             "-1: default 128, 0: save every one. Larger = fewer saves and evictions but up to N more tokens re-read on a resume; smaller = the opposite")
+             "-1: default 128, 0: save every one. Larger = fewer saves and evictions but up to N more tokens re-read on a resume; smaller = the opposite. HIP: only 0 (save every prompt) is supported")
             ("img-pre-resize,r", po::value<int>(&parsed_args.img_pre_resize)->default_value(2),
              "Pre-resize the image, 0: original size, 1: height = 480, 2: height = 720, 3: height = 1080, 4: height = 1440, 5: height = 2160, 6: height = 2880, 7: height = 3240, 8: height = 4320")
             ("socket,s", po::value<size_t>(&parsed_args.max_socket_connections)->default_value(10),
@@ -134,16 +134,25 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
              "Maximum generated tokens for a non-interactive run prompt")
             ("tools", po::value<std::string>(&parsed_args.tools_file),
              "OpenAI tool definitions JSON for run (HIP backend); prints selected tool calls")
+            ("tool-choice", po::value<std::string>(&parsed_args.tools_choice)->default_value("required"),
+             "Tool selection: required (default) or auto (call tools when needed, or answer directly)")
+            ("bench-iterations", po::value<int>(&parsed_args.iterations)->default_value(2),
+             "Iterations for bench");
+
+        po::options_description advanced("Advanced codec, sampling and demo options");
+        advanced.add_options()
+            ("sampler", po::value<std::string>(&parsed_args.sampler)->default_value("backend"),
+             "Token sampling for run/serve: backend (default) or common (CPU); model execution backend is unchanged")
+            ("hip-oga-tokenizer", po::value<std::string>(&parsed_args.hip_oga_tokenizer),
+             "Override HIP text tokenizer: oga, flm, compare, external (legacy)")
+            ("hip-oga-decoder", po::value<std::string>(&parsed_args.hip_oga_decoder),
+             "Override HIP text decoder: oga, flm, compare, external (legacy)")
             ("tool-executor", po::value<std::string>(&parsed_args.tool_executor),
              "Execute registered demo tools and complete the loop: demo")
             ("tool-data-dir", po::value<std::string>(&parsed_args.tool_data_dir),
              "Data directory for the demo tool executor (default: data beside the tools file)")
             ("max-tool-turns", po::value<int>(&parsed_args.max_tool_turns)->default_value(8),
-             "Maximum tool rounds with --tool-executor demo (1..12)")
-            ("tool-choice", po::value<std::string>(&parsed_args.tools_choice)->default_value("required"),
-             "Tool selection: required (default) or auto (call tools when needed, or answer directly)")
-            ("bench-iterations", po::value<int>(&parsed_args.iterations)->default_value(2),
-             "Iterations for bench");
+             "Maximum tool rounds with --tool-executor demo (1..12)");
 
         // Define positional arguments
         po::positional_options_description pos_desc;
@@ -158,7 +167,7 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
 
         // Combine all options
         po::options_description all_options;
-        all_options.add(general).add(hidden);
+        all_options.add(general).add(advanced).add(hidden);
 
         // Parse command line
         po::variables_map vm;
@@ -180,8 +189,8 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
         }
 
         // Help has highest priority
-        if (vm.count("help")) {
-            print_help(general);
+        if (vm.count("help") || vm.count("help-all")) {
+            print_help(general, vm.count("help-all") ? &advanced : nullptr);
             parsed_args.command = "help";
             return true;
         }

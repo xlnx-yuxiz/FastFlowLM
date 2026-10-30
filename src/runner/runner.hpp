@@ -67,6 +67,9 @@ class Runner {
 #endif
         int generate_limit;
         int ctx_length;
+        int prefix_cache_mb;
+        int prefix_slots;
+        int prefix_min_gain;
         std::string system_prompt;
         bool preemption;
         std::string backend;

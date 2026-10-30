@@ -223,10 +223,20 @@ class model_list {
 
         /// \brief get all the models
         /// \return all the models in json
-        nlohmann::json get_all_models_ollama() {
+        nlohmann::json get_all_models_ollama(bool hip_oga = false,
+                                           const std::string& direct_model_path = "") {
             nlohmann::json response = {
                 {"models", nlohmann::json::array()}
             };
+
+            if (hip_oga) {
+                const auto models = get_all_models_openai(true, direct_model_path);
+                for (const auto& model : models["data"]) {
+                    response["models"].push_back({{"name", model["id"]}, {"model", model["id"]},
+                        {"backend", "hip"}, {"hip_oga", model["hip_oga"]}});
+                }
+                return response;
+            }
 
             for (const auto& [model_type, model_subset] : this->config["models"].items()) {
                 if (model_type == "whisper-v3") continue;

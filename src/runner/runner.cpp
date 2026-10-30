@@ -71,6 +71,9 @@ Runner::Runner(model_list& supported_models, ModelDownloader& downloader, progra
       img_pre_resize(args.img_pre_resize), preemption(args.preemption),
       backend(flm::backend::normalize_backend(args.backend)), sampler_provider(args.sampler) {
     this->borrowed_npu_device = npu_device;
+    this->prefix_cache_mb = args.prefix_cache_mb;
+    this->prefix_slots = args.prefix_slots;
+    this->prefix_min_gain = args.prefix_min_gain;
 
     if (flm::backend::is_hip_oga_backend(this->backend) && (this->asr || this->embed)) {
         throw std::runtime_error(
@@ -137,6 +140,7 @@ Runner::Runner(model_list& supported_models, ModelDownloader& downloader, progra
     this->asr_supported = model_info.contains("asr") && model_info["asr"];
     // header_print("ASR", asr_supported);
     this->auto_chat_engine->configure_parameter("img_pre_resize", this->img_pre_resize);
+    this->auto_chat_engine->set_prefix_limits(prefix_cache_mb, prefix_slots, prefix_min_gain);
     if (using_hip_oga) {
         report_hip_oga_offload_policy(model_info);
     }
@@ -403,11 +407,16 @@ void Runner::run() {
             }
             else if (first_token == "/list") {
                 std::cout << "Models:" << std::endl;
-                nlohmann::json models = supported_models.get_all_models();
+                const bool hip = flm::backend::is_hip_oga_backend(this->backend);
+                nlohmann::json models = supported_models.get_all_models(hip);
                 for (const auto& model : models["models"]) {
                     std::string name = model["name"].get<std::string>();
                     std::cout << "  - " << name;
-                    switch (downloader.is_model_downloaded(name)) {
+                    const auto status = hip
+                        ? (model.value("installed", false) ? ModelDownloader::ModelStatus::Ready
+                                                           : ModelDownloader::ModelStatus::Missing)
+                        : downloader.is_model_downloaded(name);
+                    switch (status) {
                         case ModelDownloader::ModelStatus::Ready:        std::cout << " ✅"; break;
                         case ModelDownloader::ModelStatus::Missing:      std::cout << " ⏬"; break;
                         case ModelDownloader::ModelStatus::Outdated:     std::cout << " ⚠️"; break;
@@ -441,8 +450,24 @@ void Runner::run() {
                 std::cout << std::endl;
             }
             else if (first_token == "/pull") {
-                std::string model_name = input_list[1];
-                this->downloader.pull_model(model_name, this->modelscope);
+                if (input_list.size() < 2) {
+                    header_print("ERROR", "Usage: /pull <model_tag>");
+                    continue;
+                }
+                try {
+                    const std::string& model_name = input_list[1];
+                    if (flm::backend::is_hip_oga_backend(this->backend)) {
+                        if (!this->supported_models.is_model_supported(model_name))
+                            throw std::invalid_argument("Unknown HIP model tag: " + model_name);
+                        flm::hip_oga::PublicHfDownloader hip_downloader(this->supported_models);
+                        if (!hip_downloader.pull(model_name))
+                            header_print("ERROR", "Failed to pull HIP model: " << model_name);
+                    } else {
+                        this->downloader.pull_model(model_name, this->modelscope);
+                    }
+                } catch (const std::exception& error) {
+                    header_print("ERROR", "Pull failed: " << error.what());
+                }
             }
         } else {
             // This is a regular message, not a command
@@ -673,6 +698,7 @@ void Runner::cmd_load(std::vector<std::string>& input_list) {
             model_path = this->supported_models.get_model_path(new_tag);
         }
         this->auto_chat_engine->configure_parameter("img_pre_resize", this->img_pre_resize);
+        this->auto_chat_engine->set_prefix_limits(prefix_cache_mb, prefix_slots, prefix_min_gain);
         if (using_hip_oga) {
             report_hip_oga_offload_policy(model_info);
         }

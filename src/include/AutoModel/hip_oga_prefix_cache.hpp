@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -57,6 +58,20 @@ struct PrefixCacheDecision {
 
 inline bool prefix_cache_env_enabled(const char* value) {
     return value != nullptr && std::string_view(value) == "experimental";
+}
+
+// OGA retains one live generator, not a pool of host KV snapshots.
+inline void validate_prefix_cache_options(int cache_mb, int slots, int min_gain) {
+    if (cache_mb != -1)
+        throw std::invalid_argument("--prefix-cache-mb is unsupported for HIP: OGA does not expose a host KV snapshot budget");
+    if (slots < -1 || slots > 1)
+        throw std::invalid_argument("--prefix-slots supports only 0 (off) or 1 (single live generator) for HIP");
+    if (min_gain != -1 && min_gain != 0)
+        throw std::invalid_argument("--prefix-min-gain supports only 0 for HIP; checkpoint retention thresholds are not implemented");
+}
+
+inline bool prefix_cache_enabled(int slots, const char* legacy_environment) {
+    return slots == -1 ? prefix_cache_env_enabled(legacy_environment) : slots == 1;
 }
 
 class PrefixCacheState {

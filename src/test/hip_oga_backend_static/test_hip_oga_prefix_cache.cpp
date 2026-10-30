@@ -229,6 +229,26 @@ void test_env_is_experimental_only() {
             "experimental env must enable prefix cache");
 }
 
+void test_explicit_cache_controls() {
+    using namespace flm::hip_oga;
+    PrefixCacheState state;
+    state.commit_checkpoint({1, 2}, "model", 128);
+    require_fresh(decide(state, prefix_cache_enabled(0, "experimental"), true, true,
+                         "model", 128, 128, {1, 2, 3}), "disabled", 3);
+    require_hit(decide(state, prefix_cache_enabled(1, nullptr), true, true,
+                       "model", 128, 128, {1, 2, 3}), 2, 1);
+    require(!prefix_cache_enabled(-1, nullptr), "default remains disabled");
+    require(prefix_cache_enabled(-1, "experimental"), "legacy opt-in stays compatible");
+    for (int slots : {-1, 0, 1}) validate_prefix_cache_options(-1, slots, 0);
+    for (const auto& invalid : std::vector<std::vector<int>>{
+            {64, -1, -1}, {0, 0, -1}, {-1, 2, -1}, {-1, -2, -1}, {-1, 1, 128}}) {
+        bool rejected = false;
+        try { validate_prefix_cache_options(invalid[0], invalid[1], invalid[2]); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "unsupported HIP cache controls must be rejected");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -240,6 +260,7 @@ int main() {
     test_provider_exception_disables_reuse_for_session();
     test_vlm_request_forces_miss_and_clears_checkpoint();
     test_env_is_experimental_only();
+    test_explicit_cache_controls();
 
     std::cout << "PASS: HIP OGA prefix-cache policy" << std::endl;
     return 0;

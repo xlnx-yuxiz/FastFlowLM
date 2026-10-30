@@ -171,5 +171,6 @@ private:
     std::string backend;
     /// \brief the backend the currently loaded model was asked for
     std::string current_backend;
+    std::string direct_model_for_listing() const;
     PromptCache prompt_cache;
 };

@@ -1422,6 +1422,12 @@ void RestHandler::handle_embeddings(const json& request,
     }
 }
 
+std::string RestHandler::direct_model_for_listing() const {
+    if (flm::backend::is_hip_oga_backend(current_backend) &&
+        HipOgaModel::is_model_dir(current_model_tag)) return current_model_tag;
+    return HipOgaModel::is_model_dir(default_model_tag) ? default_model_tag : "";
+}
+
 ///@brief Handle the models request
 ///@param request the request
 ///@param send_response the send response
@@ -1430,7 +1436,9 @@ void RestHandler::handle_models(const json& request,
                                std::function<void(const json&)> send_response,
                                StreamResponseCallback send_streaming_response) {
     try {
-        json models = supported_models.get_all_models_ollama();
+        json models = supported_models.get_all_models_ollama(
+            flm::backend::is_hip_oga_backend(backend),
+            direct_model_for_listing());
         send_response(models);
     } catch (const std::exception& e) {
         json error_response = ExceptionResponse(e);
@@ -1459,7 +1467,9 @@ void RestHandler::handle_models_openai(const json& request,
     std::function<void(const json&)> send_response,
     StreamResponseCallback send_streaming_response) {
     try {
-        json models = supported_models.get_all_models_openai();
+        json models = supported_models.get_all_models_openai(
+            flm::backend::is_hip_oga_backend(backend),
+            direct_model_for_listing());
         send_response(models);
     }
     catch (const std::exception& e) {
