@@ -6,7 +6,6 @@
 #include "AutoModel/hip_oga_prefix_cache.hpp"
 #include "AutoModel/hip_oga_media_inputs.hpp"
 #include "AutoModel/hip_oga_text_codec.hpp"
-#include "AutoModel/hip_oga_tool_parser.hpp"
 #include "AutoModel/hip_oga_sampling.hpp"
 #include "AutoModel/hip_oga_errors.hpp"
 #include "AutoModel/hip_oga_constraint.hpp"

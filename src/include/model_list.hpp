@@ -199,18 +199,23 @@ class model_list {
 
         /// \brief get all the models
         /// \return all the models in json
-        nlohmann::json get_all_models(){
+        nlohmann::json get_all_models(bool hip_oga = false){
             nlohmann::json response = {
                 {"models", nlohmann::json::array()}
             };
 
             for (const auto& [model_type, model_subset] : this->config["models"].items()) {
                 for (const auto& [size, model_info] : model_subset.items()) {
-                    if (is_hip_oga_only_entry(model_info)) continue;
+                    const std::string tag = model_type + ":" + size;
+                    if (hip_oga) {
+                        if (!has_hip_oga_model_path(tag) ||
+                            model_info["hip_oga"].contains("legacy_alias_for")) continue;
+                    } else if (is_hip_oga_only_entry(model_info)) continue;
                     nlohmann::json model_entry = model_info;
-                    model_entry["name"] = model_type + ":" + size;
-                    model_entry["model"] = model_type + ":" + size;
-                    response["models"].push_back(model_entry);
+                    model_entry["name"] = tag;
+                    model_entry["model"] = tag;
+                    if (hip_oga) annotate_hip_oga_model(tag, model_entry);
+                    response["models"].push_back(std::move(model_entry));
                 }
             }
             return response;
@@ -246,32 +251,36 @@ class model_list {
 
         /// \brief get all the models
         /// \return all the models in json
-        nlohmann::json get_all_models_openai() {
-            nlohmann::json response = {
-                {"object", "list"},
-                {"data", nlohmann::json::array()},
-                {"object", "list" }
-            };
-
-            std::time_t now = std::time(nullptr);
-
-            for (const auto& [model_type, model_subset] : this->config["models"].items()) {
-                if (model_type == "whisper-v3") continue;
-                else if (model_type == "embed-gemma") continue;
-                else if (model_type == "d3") continue;   // decision models answer /v1/systemone only
-                for (const auto& [size, model_info] : model_subset.items()) {
-                    if (is_hip_oga_only_entry(model_info)) continue;
-                    // id uses the same "type:size" convention; created uses current epoch seconds
-                    nlohmann::json model_entry = {
-                        {"id", model_type + ":" + size},
-                        {"object", "model"},
-                        {"created", static_cast<long long>(now)},
-                        {"owned_by", "FastFlowLM"}
-                    };
-                    response["data"].push_back(model_entry);
+        nlohmann::json get_all_models_openai(bool hip_oga = false,
+                                              const std::string& direct_model_path = "") {
+            nlohmann::json response = {{"object", "list"}, {"data", nlohmann::json::array()}};
+            const auto now = static_cast<long long>(std::time(nullptr));
+            std::unordered_set<std::string> seen_ids;
+            auto add_model = [&](const nlohmann::json& entry) {
+                const std::string id = entry.at("model");
+                if (id.empty() || !seen_ids.insert(id).second) return;
+                nlohmann::json model = {{"id", id}, {"object", "model"},
+                    {"created", now}, {"owned_by", "FastFlowLM"}};
+                if (hip_oga) {
+                    model["backend"] = "hip";
+                    model["hip_oga"] = entry.at("hip_oga");
                 }
+                response["data"].push_back(std::move(model));
+            };
+            if (hip_oga && !direct_model_path.empty()) {
+                add_model(direct_hip_oga_model(direct_model_path));
             }
-
+            const auto models = get_all_models(hip_oga);
+            for (const auto& entry : models["models"]) {
+                if (hip_oga) {
+                    if (!entry.value("installed", false)) continue;
+                } else {
+                    const std::string tag = entry.at("model");
+                    const std::string family = tag.substr(0, tag.find(':'));
+                    if (family == "whisper-v3" || family == "embed-gemma" || family == "d3") continue;
+                }
+                add_model(entry);
+            }
             return response;
         }
 
@@ -312,122 +321,12 @@ class model_list {
             return files_only_in(entry->at("preferred_source"), *entry);
         }
         
-        /// \brief get HIP OGA-capable model-list entries with OGA install status
-        /// \return model-list entries whose metadata contains hip_oga.config_path
-        nlohmann::json get_all_hip_oga_models(){
-            nlohmann::json response = {
-                {"models", nlohmann::json::array()}
-            };
+        /// \brief list HIP packages through the shared catalog enumeration
+        nlohmann::json get_all_hip_oga_models() { return get_all_models(true); }
 
-            for (const auto& [model_type, model_subset] : this->config["models"].items()) {
-                for (const auto& [size, model_info] : model_subset.items()) {
-                    const std::string tag = model_type + ":" + size;
-                    if (!has_hip_oga_model_path(tag)) continue;
-                    const auto& hip_options = model_info["hip_oga"];
-                    if (hip_options.contains("legacy_alias_for")) continue;
-
-                    nlohmann::json model_entry = model_info;
-                    model_entry["name"] = tag;
-                    model_entry["model"] = tag;
-                    model_entry["backend"] = "hip";
-                    model_entry["installed"] = false;
-                    const std::string offload_policy =
-                        get_hip_oga_offload_policy(tag);
-                    model_entry["offload_policy"] = offload_policy;
-                    model_entry["hip_oga"]["offload_policy"] = offload_policy;
-                    model_entry["hip_oga"]["qualification"] = offload_policy;
-                    const std::string warning =
-                        flm::hip_oga::policy_warning(offload_policy);
-                    if (!warning.empty()) {
-                        model_entry["hip_oga"]["policy_warning"] = warning;
-                    }
-
-                    try {
-                        const std::string resolved_path = get_hip_oga_model_path(tag);
-                        model_entry["installed"] = true;
-                        model_entry["hip_oga"]["resolved_config_path"] = resolved_path;
-                        const nlohmann::json genai_config =
-                            read_hip_oga_json_object(tag,
-                                                     std::filesystem::path(resolved_path) /
-                                                         "genai_config.json");
-                        model_entry["hip_oga"]["pipeline_sections"] =
-                            flm::hip_oga::pipeline_sections(genai_config);
-                    } catch (const std::exception&) {
-                        // Missing or incomplete OGA packages are still listable,
-                        // but they should not be treated as installed.
-                    }
-
-                    response["models"].push_back(model_entry);
-                }
-            }
-            return response;
-        }
-
-        /// \brief get OpenAI model-list entries that are loadable by backend=hip
-        /// \param direct_model_path optional direct OGA directory used to start the server
-        /// \return OpenAI /v1/models response scoped to HIP OGA-loadable models
-        nlohmann::json get_all_models_openai_hip_oga(
-            const std::string& direct_model_path = "") {
-            nlohmann::json response = {
-                {"object", "list"},
-                {"data", nlohmann::json::array()}
-            };
-            std::unordered_set<std::string> seen_ids;
-            std::time_t now = std::time(nullptr);
-
-            auto add_model = [&](const std::string& id,
-                                 const nlohmann::json& hip_oga = nlohmann::json::object()) {
-                if (id.empty() || seen_ids.find(id) != seen_ids.end()) return;
-                seen_ids.insert(id);
-                nlohmann::json model = {
-                    {"id", id},
-                    {"object", "model"},
-                    {"created", static_cast<long long>(now)},
-                    {"owned_by", "FastFlowLM"},
-                    {"backend", "hip"}
-                };
-                if (!hip_oga.empty()) {
-                    model["hip_oga"] = hip_oga;
-                }
-                response["data"].push_back(std::move(model));
-            };
-
-            if (!direct_model_path.empty()) {
-                const std::string direct_policy =
-                    flm::hip_oga::direct_model_offload_policy();
-                nlohmann::json direct_hip_oga = {
-                    {"offload_policy", direct_policy},
-                    {"qualification", flm::hip_oga::kUnqualifiedPolicy},
-                    {"qualification_warning",
-                     flm::hip_oga::policy_warning(flm::hip_oga::kUnqualifiedPolicy)}
-                };
-                const std::string direct_policy_warning =
-                    flm::hip_oga::policy_warning(direct_policy);
-                if (!direct_policy_warning.empty()) {
-                    direct_hip_oga["policy_warning"] = direct_policy_warning;
-                }
-                try {
-                    const nlohmann::json genai_config =
-                        read_hip_oga_json_object("direct OGA directory",
-                                                 std::filesystem::path(direct_model_path) /
-                                                     "genai_config.json");
-                    direct_hip_oga["pipeline_sections"] =
-                        flm::hip_oga::pipeline_sections(genai_config);
-                } catch (const std::exception&) {
-                    // Direct paths are optional list entries; omit section
-                    // metadata if the package disappeared between checks.
-                }
-                add_model(direct_model_path, direct_hip_oga);
-            }
-
-            const nlohmann::json hip_models = get_all_hip_oga_models();
-            for (const auto& model : hip_models["models"]) {
-                if (!model.value("installed", false)) continue;
-                add_model(model.value("model", std::string()),
-                          model.value("hip_oga", nlohmann::json::object()));
-            }
-
-            return response;
+        /// \brief list installed HIP packages and an optional direct OGA directory
+        nlohmann::json get_all_models_openai_hip_oga(const std::string& direct_model_path = "") {
+            return get_all_models_openai(true, direct_model_path);
         }
 
         /// \brief get the declared HIP OGA offload policy for a model-list tag
@@ -809,6 +708,45 @@ class model_list {
             throw std::runtime_error("No models available for NPU platform " +
                                      this->platform_ + " with backends " +
                                      this->backend_summary());
+        }
+
+        /// \brief attach HIP package status without changing the native catalog entry
+        void annotate_hip_oga_model(const std::string& tag, nlohmann::json& entry) const {
+            const std::string policy = get_hip_oga_offload_policy(tag);
+            entry["backend"] = "hip";
+            entry["installed"] = false;
+            entry["offload_policy"] = policy;
+            auto& hip = entry["hip_oga"];
+            hip["offload_policy"] = policy;
+            hip["qualification"] = policy;
+            const std::string warning = flm::hip_oga::policy_warning(policy);
+            if (!warning.empty()) hip["policy_warning"] = warning;
+            try {
+                const std::string path = get_hip_oga_model_path(tag);
+                hip["pipeline_sections"] = flm::hip_oga::pipeline_sections(
+                    read_hip_oga_json_object(tag, std::filesystem::path(path) / "genai_config.json"));
+                hip["resolved_config_path"] = path;
+                entry["installed"] = true;
+            } catch (const std::exception&) {
+                // Missing/incomplete packages stay listable, but not installed.
+            }
+        }
+
+        static nlohmann::json direct_hip_oga_model(const std::string& path) {
+            const std::string policy = flm::hip_oga::direct_model_offload_policy();
+            nlohmann::json hip = {{"offload_policy", policy},
+                {"qualification", flm::hip_oga::kUnqualifiedPolicy},
+                {"qualification_warning", flm::hip_oga::policy_warning(flm::hip_oga::kUnqualifiedPolicy)}};
+            const std::string warning = flm::hip_oga::policy_warning(policy);
+            if (!warning.empty()) hip["policy_warning"] = warning;
+            try {
+                hip["pipeline_sections"] = flm::hip_oga::pipeline_sections(
+                    read_hip_oga_json_object("direct OGA directory",
+                        std::filesystem::path(path) / "genai_config.json"));
+            } catch (const std::exception&) {
+                // A direct path may have disappeared since the server started.
+            }
+            return {{"model", path}, {"hip_oga", std::move(hip)}};
         }
 
         static std::string getenv_string(const char* name) {

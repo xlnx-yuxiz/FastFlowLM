@@ -325,7 +325,6 @@ include("${CMAKE_SOURCE_DIR}/common/chat/chat_sources.cmake")
 file(GLOB SOURCES "src/*.cpp" "runner/*.cpp" "common/*.cpp" "common/*/*.cpp" "server/*.cpp" "pull/*.cpp" )
 file(GLOB HEADERS "include/*.hpp" "runner/*.hpp" "common/*.hpp" "common/*/*.hpp" "server/*.hpp" "pull/*.hpp")
 list(FILTER SOURCES EXCLUDE REGEX ".*/common/core/.*\\.cpp$")
-list(FILTER SOURCES EXCLUDE REGEX ".*/hip_oga_main\\.cpp$")
 
 # Model sources live two levels deeper than the globs above reach. Only the core
 # half exists as loose sources; it is built separately, below.

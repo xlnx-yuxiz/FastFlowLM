@@ -2,7 +2,7 @@
 /// \brief Public Hugging Face HIP OGA package installer
 #include "hip_oga_public_downloader.hpp"
 
-#include "picosha2.h"
+#include "download_model.hpp"
 #include "utils/debug_utils.hpp"
 
 #include <curl/curl.h>
@@ -44,25 +44,9 @@ struct FileEntry {
     std::uint64_t size = 0;
 };
 
-struct CurlGlobal {
-    CurlGlobal() {
-        curl_global_init(CURL_GLOBAL_DEFAULT);
-    }
-    ~CurlGlobal() {
-        curl_global_cleanup();
-    }
-};
-
 void ensure_curl_global() {
-    static CurlGlobal curl_global;
-    (void)curl_global;
-}
-
-size_t write_file_callback(void* ptr, size_t size, size_t nmemb, void* userdata) {
-    auto* output = static_cast<std::ofstream*>(userdata);
-    output->write(static_cast<char*>(ptr),
-                  static_cast<std::streamsize>(size * nmemb));
-    return output->good() ? size * nmemb : 0;
+    static download_utils::CurlInitializer initializer;
+    (void)initializer;
 }
 
 std::string trim_trailing_slashes(std::string value) {
@@ -86,28 +70,6 @@ std::string getenv_string(const std::string& name) {
     const char* value = std::getenv(name.c_str());
     return value && *value ? std::string(value) : std::string();
 #endif
-}
-
-void configure_curl_transport(CURL* curl) {
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-#if LIBCURL_VERSION_NUM >= 0x075500
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "HTTP,HTTPS");
-    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "HTTP,HTTPS");
-#else
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-#endif
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "FastFlowLM/1.0");
-}
-
-std::string sha256_file(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) {
-        return {};
-    }
-    std::vector<unsigned char> hash(picosha2::k_digest_size);
-    picosha2::hash256(file, hash.begin(), hash.end());
-    return picosha2::bytes_to_hex_string(hash.begin(), hash.end());
 }
 
 bool is_hex_digest(const std::string& value, std::size_t length) {
@@ -519,86 +481,21 @@ std::string build_resolve_url(const std::string& endpoint,
         "?download=true";
 }
 
-void http_download_file(const std::string& url, const std::filesystem::path& path) {
-    ensure_curl_global();
-    std::filesystem::create_directories(path.parent_path());
-
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        throw std::runtime_error("failed to initialize CURL");
-    }
-
-    std::ofstream output(path, std::ios::out | std::ios::binary | std::ios::trunc);
-    if (!output.is_open()) {
-        curl_easy_cleanup(curl);
-        throw std::runtime_error("failed to open " + path.string() + " for writing");
-    }
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_file_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &output);
-    configure_curl_transport(curl);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3600L);
-
-    CURLcode result = curl_easy_perform(curl);
-    long response_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-    output.close();
-    curl_easy_cleanup(curl);
-
-    if (result != CURLE_OK) {
-        std::filesystem::remove(path);
-        throw std::runtime_error(
-            "CURL error while downloading HIP OGA public Hugging Face URL: " +
-            std::string(curl_easy_strerror(result)));
-    }
-    if (response_code < 200 || response_code >= 300) {
-        std::filesystem::remove(path);
-        throw std::runtime_error(
-            "HTTP " + std::to_string(response_code) +
-            " while downloading HIP OGA public Hugging Face URL");
-    }
-}
-
 void download_with_sha256_retry(const std::string& url,
                                 const std::filesystem::path& path,
                                 const FileEntry& entry) {
-    std::exception_ptr last_error;
+    ensure_curl_global();
+    download_utils::DownloadRequest request{url, path, entry.size,
+        download_utils::HashAlgorithm::Sha256, lowercase_ascii(entry.sha256)};
+    request.strict_http = true;
     for (int attempt = 1; attempt <= kMaxDownloadAttempts; ++attempt) {
-        try {
-            std::filesystem::remove(path);
-            http_download_file(url, path);
-            std::error_code ec;
-            const std::uint64_t actual_size =
-                static_cast<std::uint64_t>(std::filesystem::file_size(path, ec));
-            if (ec) {
-                throw std::runtime_error(
-                    "failed to stat downloaded file " + path.string() + ": " +
-                    ec.message());
-            }
-            if (actual_size != entry.size) {
-                std::filesystem::remove(path);
-                throw std::runtime_error(
-                    "size mismatch for " + path.string() + ": expected " +
-                    std::to_string(entry.size) + ", got " +
-                    std::to_string(actual_size));
-            }
-            const std::string actual_sha256 = sha256_file(path);
-            if (actual_sha256 == lowercase_ascii(entry.sha256)) {
-                return;
-            }
-            std::filesystem::remove(path);
-            throw std::runtime_error(
-                "sha256 mismatch for " + path.string() + ": expected " +
-                entry.sha256 + ", got " + actual_sha256);
-        } catch (...) {
-            last_error = std::current_exception();
-            if (attempt < kMaxDownloadAttempts) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
+        if (download_utils::download_file_atomic(request)) return;
+        std::filesystem::remove(path.string() + ".part");
+        if (attempt < kMaxDownloadAttempts) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
-    std::rethrow_exception(last_error);
+    throw std::runtime_error("HIP OGA download failed after retries: " + entry.path);
 }
 
 std::filesystem::path make_temp_install_path(const std::filesystem::path& install_path) {
@@ -828,7 +725,7 @@ void verify_payload(const std::filesystem::path& root, const std::vector<FileEnt
         reject_symlinked_existing_components(root, file.path, "payload");
         const auto path = root / file.path;
         if (!std::filesystem::is_regular_file(path) || std::filesystem::file_size(path) != file.size ||
-            sha256_file(path) != lowercase_ascii(file.sha256)) {
+            download_utils::calculate_file_sha256(path.string()) != lowercase_ascii(file.sha256)) {
             throw std::runtime_error("HIP OGA size/sha256 mismatch or missing file: " + file.path);
         }
     }

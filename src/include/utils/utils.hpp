@@ -9,6 +9,7 @@
 #include "typedef.hpp"
 #include "buffer.hpp"
 #include "debug_utils.hpp"
+#include "console_utils.hpp"
 #include <chrono>
 #include <iostream>
 #include <fstream>
@@ -149,22 +150,6 @@ inline time_with_unit re_unit(time_with_unit time){
 } // end of namespace time_utils
 
 namespace utils {
-
-#ifdef _WIN32
-inline void enable_ansi_on_windows_once() {
-    static bool done = false;
-    if (done) return;
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut == INVALID_HANDLE_VALUE) return;
-    DWORD mode = 0;
-    if (!GetConsoleMode(hOut, &mode)) return;
-    mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    SetConsoleMode(hOut, mode);
-    done = true;
-}
-#else
-inline void enable_ansi_on_windows_once() {}
-#endif
 
 /// \brief get a random float
 /// \param min the minimum value

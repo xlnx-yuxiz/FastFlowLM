@@ -6,12 +6,15 @@
 /// \note This class for curl download
 #include "download_model.hpp"
 #include <fstream>
+#include <algorithm>
+#include <cctype>
 #include <iostream>
 #include <filesystem>
 #include <iomanip>
 #include <thread>
 #include <chrono>
-#include "utils/utils.hpp"
+#include "utils/console_utils.hpp"
+#include "utils/debug_utils.hpp"
 #include "nlohmann/json.hpp"
 #include "picosha2.h" 
 #include "sha1.hpp"
@@ -243,6 +246,13 @@ bool download_file_atomic(const DownloadRequest& request,
         return false;
     }
 
+    if (request.strict_http) {
+        std::string scheme = request.url.substr(0, request.url.find(':'));
+        std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (scheme != "http" && scheme != "https") return false;
+    }
+
     std::error_code error;
     std::filesystem::create_directories(request.destination.parent_path(), error);
     if (error) {
@@ -266,7 +276,7 @@ bool download_file_atomic(const DownloadRequest& request,
         }
     }
 
-    if (offset < request.expected_size) {
+    if (offset < request.expected_size || !std::filesystem::exists(part)) {
         CURL* curl = curl_easy_init();
         if (!curl) {
             std::cerr << "Failed to initialize CURL" << std::endl;
@@ -285,8 +295,18 @@ bool download_file_atomic(const DownloadRequest& request,
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data_to_file);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, request.strict_http ? 1L : 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, request.strict_http ? 2L : 0L);
+        if (request.strict_http) {
+#if LIBCURL_VERSION_NUM >= 0x075500
+            curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "HTTP,HTTPS");
+            curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "HTTP,HTTPS");
+#else
+            curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+            curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
+            curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+        }
         curl_easy_setopt(curl, CURLOPT_USERAGENT, "FastFlowLM/1.0");
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3600L);
         curl_slist* headers = request.use_hf_token
@@ -301,12 +321,19 @@ bool download_file_atomic(const DownloadRequest& request,
         }
 
         const CURLcode result = curl_easy_perform(curl);
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
         fclose(fp);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         show_cursor();
         if (g_progress_bar_shown) {
             std::cout << std::endl;
+        }
+        if (request.strict_http && (status < 200 || status >= 300)) {
+            std::filesystem::remove(part, error);
+            std::cerr << "HTTP download failed with status " << status << std::endl;
+            return false;
         }
         if (result != CURLE_OK) {
             std::cerr << "CURL error: " << curl_easy_strerror(result) << std::endl;

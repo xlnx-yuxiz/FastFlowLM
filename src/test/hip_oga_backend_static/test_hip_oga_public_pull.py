@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import http.server
 import json
@@ -214,6 +215,7 @@ def compile_test_binary(output: Path) -> tuple[Path, Path]:
         str(ROOT / "src/pull"),
         str(TEST_CPP),
         str(PUBLIC_DOWNLOADER_CPP),
+        str(ROOT / "src/pull/download_model.cpp"),
         "-lcurl",
         "-pthread",
         "-o",
@@ -591,12 +593,20 @@ def assert_symlink_case_did_not_escape(tmp: Path) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--public-binary", type=Path)
+    parser.add_argument("--overlay-binary", type=Path)
+    args = parser.parse_args()
+    if bool(args.public_binary) != bool(args.overlay_binary):
+        parser.error("provide both prebuilt binaries or neither")
     scratch_parent = Path(tempfile.gettempdir())
     with tempfile.TemporaryDirectory(
         prefix="flm-hip-oga-public-", dir=scratch_parent
     ) as tmp_name:
         tmp = Path(tmp_name)
-        public_binary, overlay_binary = compile_test_binary(tmp)
+        public_binary, overlay_binary = (
+            (args.public_binary, args.overlay_binary)
+            if args.public_binary else compile_test_binary(tmp))
         subprocess.run([str(overlay_binary)], cwd=ROOT, check=True)
 
         cases = [

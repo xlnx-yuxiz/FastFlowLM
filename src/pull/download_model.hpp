@@ -26,6 +26,8 @@ struct DownloadRequest {
     HashAlgorithm hash_algorithm;
     std::string expected_hash;
     bool use_hf_token = false;
+    // Require HTTP(S), verified TLS and a successful HTTP status.
+    bool strict_http = false;
 };
 
 std::string calculate_file_sha256(const std::string& file_path);
