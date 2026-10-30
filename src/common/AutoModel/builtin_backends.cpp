@@ -6,6 +6,7 @@
 ///       engine also register a core backend, and only when this build has one.
 #include "AutoModel/automodel.hpp"
 #include "AutoModel/flm_backend.hpp"
+#include "AutoModel/hip_oga_backend.hpp"
 #include "AutoModel/model_backend.hpp"
 
 #if defined(FLM_ENABLE_CORE)
@@ -83,6 +84,10 @@ void register_builtin_backends(BackendRegistry& registry) {
     registry.register_backend("llama3", flm::backend::kCoreBackendId,
                               flm::llama::core_factory(),
                               flm::llama::core_traits());
+#endif
+
+#if defined(FLM_ENABLE_HIP_OGA)
+    register_hip_oga_backends(registry);
 #endif
 }
 

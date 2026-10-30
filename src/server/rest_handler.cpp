@@ -7,6 +7,16 @@
  *  \version 0.9.24
  */
 #include "rest_handler.hpp"
+#include "backend_options.hpp"
+#include "AutoModel/hip_oga_sampling.hpp"
+#include "AutoModel/hip_oga_errors.hpp"
+#include "hip_oga_ensure_model.hpp"
+#include "hip_oga_policy.hpp"
+#include "chat/chat_output.hpp"
+#include "chat/auto_tools.hpp"
+#include "chat/tool_history.hpp"
+#include "request_scope.hpp"
+
 #include "wstream_buf.hpp"
 #include "streaming_ostream.hpp"
 #include "streaming_ostream_openai.hpp"
@@ -33,6 +43,8 @@ json ModelErrorResponse(const ModelRequestError& error) {
 json ExceptionResponse(const std::exception& error) {
     if (const auto* model_error = dynamic_cast<const ModelRequestError*>(&error))
         return ModelErrorResponse(*model_error);
+    if (dynamic_cast<const flm::sampling::SamplingRequestError*>(&error))
+        return {{"error", {{"message", error.what()}, {"type", "invalid_request_error"}, {"code", 400}}}};
     return {{"error", error.what()}};
 }
 
@@ -488,6 +500,116 @@ static json convert_tool_responses_gemma4(json messages) {
     return converted_messages;
 }
 
+
+static json normalize_hip_oga_template(json messages, bool fail_fast_invalid_images = false) {
+    json template_message = json::array();
+
+    for (auto& message : messages) {
+        json new_message = message;
+        std::string merged_text;
+        nlohmann::ordered_json::array_t merged_images;
+        nlohmann::ordered_json::array_t merged_audio;
+
+        if (message["content"].is_string()) {
+            // Simple format: just text
+            merged_text = message["content"].get<std::string>();
+        }
+        else if (message["content"].is_array()) {
+            // Structured format: extract text and image URLs
+            for (auto& contentItem : message["content"]) {
+                if (contentItem.contains("type") && contentItem["type"] == "text") {
+                    merged_text += contentItem["text"].get<std::string>();
+                }
+                else if (contentItem.contains("type") && contentItem["type"] == "image_url") {
+                    std::string image_url = contentItem["image_url"]["url"].get<std::string>();
+                    const std::vector<std::string> prefixes = {
+                        "data:image/png;base64,",
+                        "data:image/jpeg;base64,",
+                        "data:image/jpg;base64,"
+                    };
+                    bool stripped_supported_image_prefix = false;
+                    for (const auto& prefix : prefixes) {
+                        if (image_url.substr(0, prefix.length()) == prefix) {
+                            image_url = image_url.substr(prefix.length());
+                            stripped_supported_image_prefix = true;
+                            break;
+                        }
+                    }
+                    if (image_url.empty()) {
+                        if (fail_fast_invalid_images) {
+                            throw std::runtime_error(
+                                "HIP OGA backend image_url payloads must be non-empty");
+                        }
+                        header_print("Warning", "Empty image, skipping this image.");
+                        continue;
+                    }
+                    if (image_url.substr(0, 5) == "data:") {
+                        if (fail_fast_invalid_images) {
+                            throw std::runtime_error(
+                                "HIP OGA backend supports only data:image/png;base64 or data:image/jpeg;base64 image_url payloads");
+                        }
+                        header_print("Warning", "Unsupported image format, skipping this image.");
+                        continue;
+                    }
+                    if (fail_fast_invalid_images && !stripped_supported_image_prefix) {
+                        throw std::runtime_error(
+                            "HIP OGA backend OpenAI image_url payloads must use data:image/png;base64 or data:image/jpeg;base64");
+                    }
+                    merged_images.push_back(image_url);
+                }
+                else if (contentItem.contains("type") && contentItem["type"] == "input_audio") {
+                    std::string audio_base64 = contentItem["input_audio"]["data"].get<std::string>();
+                    if (audio_base64.empty()) {
+                        header_print("Warning", "Empty audio, skipping this audio.");
+                        continue;
+                    }
+                    merged_audio.push_back(audio_base64);
+                }
+            }
+        }
+
+        //new_message["role"] = message["role"];
+        new_message["content"] = merged_text;
+        if (!merged_images.empty()) {
+            new_message["images"] = merged_images;
+        }
+        if (!merged_audio.empty()) {
+            new_message["audios"] = merged_audio;
+        }
+
+
+        template_message.push_back(new_message);
+    }
+
+    return template_message;
+}
+static bool normalized_messages_have_media(const json& messages) {
+    if (!messages.is_array()) return false;
+    for (const auto& message : messages) {
+        if (!message.is_object()) continue;
+        if (message.contains("images") && !message["images"].empty()) return true;
+        if (message.contains("audios") && !message["audios"].empty()) return true;
+    }
+    return false;
+}
+static void configure_hip_oga_requested_max_tokens(AutoModel* engine,
+                                                   int length_limit) {
+    if (engine == nullptr) return;
+    (void)engine->configure_parameter("hip_oga_requested_max_tokens", length_limit);
+}
+void report_hip_oga_offload_policy(const json& model_info) {
+    const std::string policy = flm::hip_oga::runtime_offload_policy(
+        nlohmann::json::parse(model_info.dump()));
+    header_print("FLM", "HIP OGA offload_policy=" << policy);
+    if (policy == flm::hip_oga::kStrictGpuPolicy) {
+        header_print("FLM", "strict_gpu enforces session.disable_cpu_ep_fallback=1 for each OGA session section.");
+    }
+    const std::string warning = flm::hip_oga::policy_warning(policy);
+    if (!warning.empty()) {
+        header_print("WARNING", warning);
+    }
+}
+
 ///@brief RestHandler constructor
 ///@param models the model list
 ///@param downloader the downloader
@@ -498,14 +620,12 @@ static json convert_tool_responses_gemma4(json messages) {
 ///@return the rest handler
 RestHandler::RestHandler(model_list& models, ModelDownloader& downloader, program_args_t& args,
                          flm_rt::device* npu_device)
-    : supported_models(models), downloader(downloader), default_model_tag(args.model_tag), current_model_tag(""), modelscope(args.modelscope), asr(args.asr), embed(args.embed), img_pre_resize(args.img_pre_resize), preemption(args.preemption), backend(args.backend) {
+    : supported_models(models), downloader(downloader), default_model_tag(args.model_tag), current_model_tag(""), modelscope(args.modelscope), asr(args.asr), embed(args.embed), img_pre_resize(args.img_pre_resize), preemption(args.preemption), backend(flm::backend::normalize_backend(args.backend)), sampler_provider(args.sampler) {
 
-    // RAI receives the device from corelib; non-RAI creates its own here.
-    if (npu_device != nullptr) {
-        npu_device_inst = npu_device;
-    } else {
-        owned_device = flm_rt::device(0);
-        npu_device_inst = &(*owned_device);
+    npu_device_inst = npu_device;
+    if (flm::backend::is_hip_oga_backend(backend)) {
+        this->asr = false;
+        this->embed = false;
     }
 
     if (args.ctx_length != -1) {
@@ -548,7 +668,7 @@ RestHandler::RestHandler(model_list& models, ModelDownloader& downloader, progra
     }
 
     if (default_model_tag != "model-faker") {
-        if (!supported_models.is_model_supported(default_model_tag)) {
+        if (!HipOgaModel::is_model_dir(default_model_tag) && !supported_models.is_model_supported(default_model_tag)) {
             header_print("Warning", "Default model tag '" << default_model_tag << "' is not supported. Falling back to 'llama3.2:1b'.");
             this->default_model_tag = "llama3.2:1b";
         }
@@ -566,16 +686,40 @@ RestHandler::RestHandler(model_list& models, ModelDownloader& downloader, progra
 ///@return the rest handler
 RestHandler::~RestHandler() = default;
 
+flm_rt::device* RestHandler::ensure_npu_device() {
+    if (!npu_device_inst) {
+        owned_device.emplace(0);
+        npu_device_inst = &*owned_device;
+    }
+    return npu_device_inst;
+}
+
+void RestHandler::clear_cancelled_request() noexcept {
+    prompt_cache.reset();
+    try {
+        if (auto_chat_engine) auto_chat_engine->clear_context();
+    } catch (...) {
+        auto_chat_engine.reset();
+        current_model_tag = "model-faker";
+        current_backend.clear();
+    }
+}
+
+
 ///@brief Ensure the model is loaded
 ///@param model_tag the model tag
 bool RestHandler::ensure_model_loaded(const std::string& model_tag,
                                       const std::string& request_backend) {
+    const std::string requested_backend = flm::backend::normalize_backend(
+        request_backend.empty() ? this->backend : request_backend);
+    const bool hip = flm::backend::is_hip_oga_backend(requested_backend);
+    const bool direct = hip && HipOgaModel::is_model_dir(model_tag);
     // Refuse a name the catalog does not have before anything resolves it;
     // an unknown name used to load a substitute model (and on dev04 could
     // end the process). Checked after rectify_model_tag, as get_model_info
     // does, so "Ollama/<tag>" and bare family names still resolve.
     // "model-faker" means no model was chosen.
-    if (model_tag != "model-faker" &&
+    if (!direct && model_tag != "model-faker" &&
         !supported_models.is_model_supported(
             supported_models.rectify_model_tag(model_tag))) {
         header_print_r("ERROR", "Model tag '" << model_tag
@@ -591,11 +735,9 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
 
     // A per-request "backend" overrides --backend; either one differing from
     // what is loaded forces a reload, exactly as a different model tag does.
-    const std::string requested_backend =
-        request_backend.empty() ? this->backend : request_backend;
     // Compared in its resolved form, which is what current_model_tag holds, so
     // "llama3.2" or "Ollama/llama3.2:1b" does not reload llama3.2:1b each time.
-    const std::string resolved_tag = supported_models.rectify_model_tag(model_tag);
+    const std::string resolved_tag = direct ? model_tag : supported_models.rectify_model_tag(model_tag);
     if (current_model_tag != resolved_tag || current_backend != requested_backend) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         // The old model is released before the new one is built, so from here
@@ -611,7 +753,21 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
         // The cached conversation lived in the engine just released.
         this->prompt_cache.reset();
         try {
-            auto [ensure_tag, engine] = get_auto_model(model_tag, this->supported_models, this->npu_device_inst);
+            auto [ensure_tag, engine] = get_auto_model(model_tag, this->supported_models,
+                hip ? nullptr : ensure_npu_device(), requested_backend);
+            json model_info;
+            std::string model_path;
+            if (hip) {
+                if (direct) {
+                    model_info = HipOgaModel::model_info_for_path(model_tag);
+                    model_path = model_tag;
+                } else {
+                    model_info = supported_models.get_model_info(ensure_tag).second;
+                    model_path = flm::hip_oga::ensure_hip_oga_model(supported_models, ensure_tag);
+                    model_info["hip_oga"]["config_path"] = model_path;
+                }
+                report_hip_oga_offload_policy(model_info);
+            } else {
             switch (downloader.is_model_downloaded(ensure_tag, false, /*fast_check=*/true)) {
                 case ModelDownloader::ModelStatus::Ready:
                     break;
@@ -624,13 +780,17 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
                 case ModelDownloader::ModelStatus::Incompatible:
                     throw std::runtime_error(ensure_tag + " is incompatible with this version of FastFlowLM");
             }
-            auto [new_ensure_tag, model_info] = supported_models.get_model_info(ensure_tag);
+                auto entry = supported_models.get_model_info(ensure_tag);
+                model_info = std::move(entry.second);
+                model_path = supported_models.get_model_path(entry.first);
+            }
             engine->set_server_mode(true);
             engine->configure_parameter("img_pre_resize", this->img_pre_resize);
             engine->set_prefix_limits(this->prefix_cache_mb, this->prefix_slots, this->prefix_min_gain);
             const auto load_started = std::chrono::steady_clock::now();
-            engine->load_model(supported_models.get_model_path(new_ensure_tag), model_info, ctx_length, preemption, requested_backend);
+            engine->load_model(model_path, model_info, ctx_length, preemption, requested_backend);
             report_load_time(load_started);
+            engine->set_sampling_provider(this->sampler_provider);
 
             // Per model, not per process: the flash models take 1024-token
             // chunks and the rest 4096, so keeping the first model's value
@@ -667,7 +827,7 @@ void RestHandler::ensure_asr_model_loaded(const std::string& model_tag) {
             this->asr = false;
             return;
     }
-    this->whisper_engine = std::make_unique<Whisper>(this->npu_device_inst);
+    this->whisper_engine = std::make_unique<Whisper>(ensure_npu_device());
     auto [new_ensure_tag, whisper_model_info] = this->supported_models.get_model_info(ensure_tag);
     std::string whisper_model_path = this->supported_models.get_model_path(new_ensure_tag);
     try {
@@ -706,7 +866,7 @@ void RestHandler::ensure_decision_model_loaded(const std::string& model_tag) {
     auto [resolved_tag, model_info] = this->supported_models.get_model_info(ensure_tag);
     std::string model_path = this->supported_models.get_model_path(resolved_tag);
     try {
-        this->decision_engine = std::make_unique<AutoDecisionModel>(this->npu_device_inst, resolved_tag);
+        this->decision_engine = std::make_unique<AutoDecisionModel>(ensure_npu_device(), resolved_tag);
         this->decision_engine->load_model(model_path, model_info, this->preemption);
         this->decision_engine->warmup();
     }
@@ -779,7 +939,7 @@ void RestHandler::ensure_embed_model_loaded(const std::string& model_tag) {
             this->embed = false;
             return;
     }
-    auto [embedding_model_tag, auto_embedding_engine] = get_auto_embedding_model(ensure_tag, this->npu_device_inst);
+    auto [embedding_model_tag, auto_embedding_engine] = get_auto_embedding_model(ensure_tag, ensure_npu_device());
     this->auto_embedding_engine = std::move(auto_embedding_engine);
     auto [new_embedding_model_tag, embedding_model_info] = this->supported_models.get_model_info(embedding_model_tag);
     std::string embedding_model_path = this->supported_models.get_model_path(new_embedding_model_tag);
@@ -799,6 +959,12 @@ void RestHandler::ensure_embed_model_loaded(const std::string& model_tag) {
 ///@param options the options JSON object
 ///@param request the request JSON object
 void RestHandler::configure_chat_engine_parameters(const json& options, const json& request) {
+    const bool use_service = auto_chat_engine->backend_id() == "hip" || sampler_provider == "common" ||
+        has_value(request, "sampler") || has_value(options, "sampler");
+    if (use_service) {
+        auto_chat_engine->configure_sampling_request(
+            flm::sampling::normalize_sampling_request(options, request), true);
+    } else {
     if (has_value(request, "temperature")) {
         float temperature = request["temperature"];
         auto_chat_engine->set_temperature(temperature);
@@ -827,6 +993,7 @@ void RestHandler::configure_chat_engine_parameters(const json& options, const js
         float repetition_penalty = request["repetition_penalty"];
         auto_chat_engine->set_repetition_penalty(repetition_penalty);
     }
+    }
     if (has_value(request, "think")) {
         bool enable_thinking = request["think"];
         auto_chat_engine->configure_parameter("enable_think", enable_thinking);
@@ -850,9 +1017,19 @@ json RestHandler::build_nstream_response(const std::string& response_text, chat_
                                          const chat_parse_options& parse_options,
                                          chat_logprobs_aligner* logprobs) {
     const chat_format_spec& spec = auto_chat_engine->get_chat_format();
-    chat_msg parsed = chat_parse(spec,
+    chat_msg parsed;
+    if (auto_chat_engine->backend_id() == "hip") {
+        chat_output output(spec, chat_format_prefill(spec, meta_info.prompt_tail),
+            parse_options.tools ? *parse_options.tools : json::array(), true,
+            parse_options.parse_tool_calls, parse_options.json_content, parse_options.structured_auto);
+        auto result = output.update(response_text, true);
+        if (!result.error.empty()) throw ModelRequestError(422, true, result.error, "model_output_error");
+        parsed = std::move(result.message);
+    } else {
+    parsed = chat_parse(spec,
                                  chat_format_prefill(spec, meta_info.prompt_tail, meta_info.continue_final_message) + response_text,
                                  false, parse_options);
+    }
 
     json message;
     message["role"] = "assistant";
@@ -1413,6 +1590,10 @@ void RestHandler::handle_openai_chat_completion(const json& request,
                                                std::function<void(const json&)> send_response,
                                                StreamResponseCallback send_streaming_response,
                                                std::shared_ptr<CancellationToken> cancellation_token) {
+    const auto request_cancelled = [&] { return cancellation_token && cancellation_token->cancelled(); };
+    flm::server::RequestScope cleanup_request([&] {
+        if (request_cancelled()) clear_cancelled_request();
+    });
     try {
         // Extract OpenAI-style parameters
         if (!has_value(request, "messages") || !request.at("messages").is_array()) {
@@ -1430,7 +1611,9 @@ void RestHandler::handle_openai_chat_completion(const json& request,
         // tool_choice, parallel_tool_calls and response_format become a decoding constraint
         chat_constraint_request constraint_request;
         std::string request_error;
-        if (!chat_constraint_request_from_openai(request, tools, constraint_request, request_error)) {
+        if (!chat_constraint_request_from_openai(request, tools, constraint_request, request_error,
+                flm::backend::is_hip_oga_backend(flm::backend::normalize_backend(
+                    request_backend.empty() ? this->backend : request_backend)))) {
             send_response({{"error", {{"message", request_error}, {"type", "invalid_request_error"}, {"code", 400}}}});
             return;
         }
@@ -1474,10 +1657,16 @@ void RestHandler::handle_openai_chat_completion(const json& request,
         }
 
         configure_chat_engine_parameters(options, request);
-        apply_sampling_request(*auto_chat_engine, sampling);
+        const bool hip = auto_chat_engine->backend_id() == "hip";
+        if (!hip) apply_sampling_request(*auto_chat_engine, sampling);
+        if (hip && !flm::chat::normalize_openai_tool_history(current_messages, request_error)) {
+            send_response({{"error", {{"message", request_error}, {"type", "invalid_request_error"}, {"code", 400}}}});
+            return;
+        }
+        if (hip) configure_hip_oga_requested_max_tokens(auto_chat_engine.get(), length_limit);
 
         current_messages = normalize_messages(current_messages);
-        current_messages = normalize_template(current_messages);
+        current_messages = hip ? normalize_hip_oga_template(current_messages, true) : normalize_template(current_messages);
         if (continue_final) {
             request_error = continue_final_message_error(current_messages);
             if (!request_error.empty()) {
@@ -1551,6 +1740,15 @@ void RestHandler::handle_openai_chat_completion(const json& request,
         lm_uniform_input_t uniformed_input;
         uniformed_input.messages = current_messages;
         uniformed_input.tools = tools;
+        if (constraint_request.structured_auto) {
+            if (!hip || normalized_messages_have_media(current_messages)) {
+                send_response({{"error", {{"message", "Structured tool routing requires a HIP text model"},
+                    {"type", "invalid_request_error"}, {"code", 400}}}});
+                return;
+            }
+            uniformed_input.messages = chat_prepare_auto_tools(current_messages, tools);
+            uniformed_input.tools = json::array();
+        }
         const std::optional<int> openai_chat_budget = has_value(request, "max_tokens")
             ? std::optional<int>(request.at("max_tokens").get<int>())
             : has_value(request, "max_completion_tokens")
@@ -1572,13 +1770,15 @@ void RestHandler::handle_openai_chat_completion(const json& request,
         // tool markup is only a tool call when the request offered tools
         chat_parse_options parse_options;
         parse_options.tools = &tools;
+        parse_options.json_content = hip && (constraint_request.json_object || !constraint_request.json_schema.is_null());
+        parse_options.structured_auto = constraint_request.structured_auto;
         parse_options.parse_tool_calls = !tools.empty() && constraint_request.tool_choice != chat_tool_choice::NONE;
         parse_options.keep_whitespace = continue_final;
         // a model that reasons first reads the continued message as its reasoning
         parse_options.reasoning_may_close = continue_final && auto_chat_engine->thinking_enabled();
         if (stream){
             // Create a wrapper callback that passes the pre-formatted SSE string directly
-            cancellation_token->reset();
+            if (request_cancelled()) return;
             bool stream_started = false;
             auto openai_stream_callback = [&send_streaming_response, &stream_started](const std::string& data, bool is_final) {
                 stream_started = true;
@@ -1601,7 +1801,7 @@ void RestHandler::handle_openai_chat_completion(const json& request,
 
             header_print("FLM", "Start prefill...");
             try {
-                bool success = auto_chat_engine->insert(meta_info, uniformed_input, [&] { return cancellation_token->cancelled(); });
+                bool success = auto_chat_engine->insert(meta_info, uniformed_input, request_cancelled);
                 if (!success) {
                     if (meta_info.stop_reason == CANCEL_DETECTED || cancellation_token->cancelled()) {
                         meta_info.stop_reason = CANCEL_DETECTED;
@@ -1634,7 +1834,7 @@ void RestHandler::handle_openai_chat_completion(const json& request,
             ostream.start(meta_info);
             header_print("FLM", "Start generating...");
             try {
-                auto_chat_engine->generate(meta_info, length_limit, ostream, [&] { return cancellation_token->cancelled(); });
+                auto_chat_engine->generate(meta_info, length_limit, ostream, request_cancelled);
             } catch (const ModelRequestError& error) {
                 send_stream_error(ModelErrorResponse(error));
                 if (error.session_cleared()) this->prompt_cache.reset();
@@ -1669,7 +1869,7 @@ void RestHandler::handle_openai_chat_completion(const json& request,
             std::string response_text;
             header_print("FLM", "Start prefill...");
             try {
-                bool success = auto_chat_engine->insert(meta_info, uniformed_input, [&] { return cancellation_token->cancelled(); });
+                bool success = auto_chat_engine->insert(meta_info, uniformed_input, request_cancelled);
                 if (!success) {
                     if (meta_info.stop_reason == CANCEL_DETECTED || cancellation_token->cancelled()) {
                         meta_info.stop_reason = CANCEL_DETECTED;
@@ -1700,7 +1900,7 @@ void RestHandler::handle_openai_chat_completion(const json& request,
             }
             header_print("FLM", "Start generating...");
             try {
-                response_text = auto_chat_engine->generate(meta_info, length_limit, out, [&] { return cancellation_token->cancelled(); });
+                response_text = auto_chat_engine->generate(meta_info, length_limit, out, request_cancelled);
                 out.flush();
             } catch (const std::exception& e) {
                 json error_response = ExceptionResponse(e);

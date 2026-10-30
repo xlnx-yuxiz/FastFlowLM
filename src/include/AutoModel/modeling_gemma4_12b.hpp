@@ -97,6 +97,7 @@ private:
         int pooling_kernel_size
     );
 public:
+	bool supports_common_sampling() const override { return false; }
     Gemma4_12B(flm_rt::device* npu_device_inst);
 
     void load_model(std::string model_path, json model_inf, int default_context_length = -1, bool enable_preemption = false, const std::string& backend = "") override;

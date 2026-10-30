@@ -223,9 +223,8 @@ void register_builtin_backends(BackendRegistry& registry);
 ///       reasonably ask for a flow the build lacks, because model_list has
 ///       already pruned the entries whose flow is missing -- so a throw here
 ///       means a genuine mismatch, not a routine packaging gap.
-/// \note `fallback` arrives as a string so that this header stays free of the
-///       NPU runtime includes, which is what lets test/model_backend build
-///       without an XRT toolchain.
+/// \note `fallback` arrives as a string, independent of model catalog storage.
+///       Tests use the CLI runtime headers but do not allocate a device.
 std::string resolve_backend_id(const std::string& family,
                                const std::string& fallback,
                                const std::string& requested = "",

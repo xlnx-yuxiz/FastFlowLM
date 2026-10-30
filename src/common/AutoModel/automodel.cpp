@@ -668,6 +668,7 @@ std::string AutoModel::_render_chat_template(minja::chat_template_inputs& inputs
 }
 
 void AutoModel::_begin_turn(chat_meta_info_t& meta_info, const std::vector<int>& prompt_tokens) {
+    begin_sampling_turn();
     // keep the end of the prompt as the model sees it: generation continues from
     // there, so it tells the output parser whether a reasoning block is already open.
     // A continued message may have opened one anywhere in its text, so then it is
@@ -976,6 +977,17 @@ void AutoModel::set_sampler(sampler_config& sampler_config) {
         this->sampler.reset();
     }
     this->sampler = std::make_unique<Sampler>(this->lm_config->get("vocab_size"), sampler_config);
+    const auto& config = sampler_config;
+    nlohmann::json defaults = {
+        {"do_sample", config.temperature != 0 && config.top_k != 1},
+        {"temperature", config.temperature}, {"top_k", config.top_k},
+        {"top_p", config.top_p}, {"min_p", config.min_p},
+        {"repetition_penalty", config.rep_penalty},
+        {"presence_penalty", config.pre_penalty}, {"frequency_penalty", config.freq_penalty},
+        {"random_seed", -1}};
+    if (config.has_rng_seed || config.rng_seed != 0) defaults["random_seed"] = config.rng_seed;
+    sampling_state_ = std::make_unique<flm::sampling::SamplingState>(
+        defaults, static_cast<int>(this->lm_config->get("vocab_size")));
 }
 
 /// \brief Set the max length
@@ -1100,6 +1112,7 @@ void AutoModel::verbose() {
 /// \note The function will set the top-k
 /// \note The function will check if the top-k is valid
 void AutoModel::set_topk(int topk) {
+    if (common_sampling_enabled()) { configure_sampling_request({{"top_k", topk}}, false); return; }
     if (topk < 1) {
         header_print("WARNING", "Top-k must be greater than 0");
         return;
@@ -1117,6 +1130,7 @@ void AutoModel::set_topk(int topk) {
 /// \note The function will set the top-p
 /// \note The function will check if the top-p is valid
 void AutoModel::set_topp(float topp) {
+    if (common_sampling_enabled()) { configure_sampling_request({{"top_p", topp}}, false); return; }
     if (topp < 0.0f || topp > 1.0f) {
         header_print("WARNING", "Top-p must be between 0.0 and 1.0");
         return;
@@ -1129,6 +1143,7 @@ void AutoModel::set_topp(float topp) {
 /// \note The function will set the min-p
 /// \note The function will check if the min-p is valid
 void AutoModel::set_minp(float minp) {
+    if (common_sampling_enabled()) { configure_sampling_request({{"min_p", minp}}, false); return; }
     if (minp < 0.0f || minp > 1.0f) {
         header_print("WARNING", "Min-p must be between 0.0 and 1.0");
         return;
@@ -1141,6 +1156,7 @@ void AutoModel::set_minp(float minp) {
 /// \note The function will set the temperature
 /// \note The function will check if the temperature is valid
 void AutoModel::set_temperature(float temperature) {
+    if (common_sampling_enabled()) { configure_sampling_request({{"temperature", temperature}}, false); return; }
     if (temperature < 0.0f) {
         header_print("WARNING", "Temperature must be greater than 0.0");
         return;
@@ -1153,6 +1169,7 @@ void AutoModel::set_temperature(float temperature) {
 /// \note The function will set the presence penalty
 /// \note The function will check if the presence penalty is valid
 void AutoModel::set_presence_penalty(float presence_penalty) {
+    if (common_sampling_enabled()) { configure_sampling_request({{"presence_penalty", presence_penalty}}, false); return; }
     if (presence_penalty < 0.0f) {
         header_print("WARNING", "Presence penalty must be greater than 0.0");
         return;
@@ -1165,6 +1182,7 @@ void AutoModel::set_presence_penalty(float presence_penalty) {
 /// \note The function will set the repetition penalty
 /// \note The function will check if the repetition penalty is valid
 void AutoModel::set_repetition_penalty(float repetition_penalty) {
+    if (common_sampling_enabled()) { configure_sampling_request({{"repetition_penalty", repetition_penalty}}, false); return; }
     if (repetition_penalty < 0.0f) {
         header_print("WARNING", "Repetition penalty must be greater than 0.0");
         return;
@@ -1178,6 +1196,7 @@ void AutoModel::set_repetition_penalty(float repetition_penalty) {
 /// \brief Set the frequency penalty
 /// \param frequency_
 void AutoModel::set_frequency_penalty(float frequency_penalty) {
+    if (common_sampling_enabled()) { configure_sampling_request({{"frequency_penalty", frequency_penalty}}, false); return; }
     if (frequency_penalty < 0.0f) {
         header_print("WARNING", "Frequency penalty must be greater than 0.0");
         return;
@@ -1250,4 +1269,75 @@ void AutoModel::start_total_timer() {
 /// \note The function will check if the total timer is valid
 void AutoModel::stop_total_timer() {
     this->profiler_list[TOTAL_TIME].stop(this->total_tokens, true);
+}
+
+
+void AutoModel::set_sampling_provider(const std::string& name) {
+    const auto provider = flm::sampling::parse_provider(name);
+    if (provider == flm::sampling::Provider::Common && !supports_common_sampling())
+        throw flm::sampling::SamplingRequestError("Common sampling is unavailable for this native model's token-history path");
+    if (!sampling_state_ || !sampler)
+        throw flm::sampling::SamplingRequestError("Sampling configuration needs a loaded model");
+    sampling_state_->set_default_provider(name);
+    configure_sampling_request(nlohmann::json::object());
+}
+
+
+void AutoModel::begin_sampling_turn() {
+    if (!common_sampling_enabled()) return;
+    if (!supports_common_sampling())
+        throw flm::sampling::SamplingRequestError("Common sampling is unavailable for this native model's token-history path");
+    sampler->configure_common(flm::sampling::sampling_logits_options(sampling_state_->effective()),
+                              &token_history, flm::sampling::request_seed(sampling_state_->effective()));
+}
+
+
+void AutoModel::configure_sampling_request(const nlohmann::json& options, bool reset) {
+    if (!sampling_state_ || !sampler)
+        throw flm::sampling::SamplingRequestError("Sampling configuration needs a loaded model");
+    auto candidate = *sampling_state_;
+    if (reset) candidate.reset_request(options);
+    else candidate.update(options);
+    if (candidate.provider() == flm::sampling::Provider::Common && !supports_common_sampling())
+        throw flm::sampling::SamplingRequestError("Common sampling is unavailable for this native model's token-history path");
+    *sampling_state_ = std::move(candidate);
+    if (common_sampling_enabled()) {
+        begin_sampling_turn();
+        return;
+    }
+    sampler->disable_common();
+    // Compatibility provider retains native setter/window behavior. Common
+    // request overrides never mutate these legacy fields or penalty/RNG state.
+    if (options.contains("temperature")) set_temperature(options.at("temperature").get<float>());
+    if (options.contains("top_k")) set_topk(options.at("top_k").get<int>());
+    if (options.contains("top_p")) set_topp(options.at("top_p").get<float>());
+    if (options.contains("min_p")) set_minp(options.at("min_p").get<float>());
+    if (options.contains("repetition_penalty")) set_repetition_penalty(options.at("repetition_penalty").get<float>());
+    if (options.contains("presence_penalty")) set_presence_penalty(options.at("presence_penalty").get<float>());
+    if (options.contains("frequency_penalty")) set_frequency_penalty(options.at("frequency_penalty").get<float>());
+    if (options.contains("seed") && options.at("seed").get<int>() >= 0)
+        sampler->set_seed(static_cast<uint64_t>(options.at("seed").get<int>()));
+}
+
+void AutoModel::_release_model_state() noexcept {
+    // Engines borrow config/NPU resources. Destroy the owner before either
+    // dependency, including during failed replacement and base destruction.
+    lm_engine = nullptr;
+    backend_.reset();
+    npu.reset();
+    lm_config.reset();
+    tokenizer.reset();
+    sampler.reset();
+    sampling_state_.reset();
+    chat_tmpl.reset();
+    chat_format = {};
+    is_model_loaded = false;
+    model_path.clear();
+    token_history.clear();
+    checkpoint_his.clear();
+    eos_token_ids.clear();
+    last_token = -1;
+    total_tokens = 0;
+    MAX_L = 0;
+    enable_preemption = false;
 }

@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HIP OGA text-codec parity evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "codec_selector",
+    "default_provider",
+    "fixture",
+    "parity",
+    "detokenizer"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "codec_selector": {
+      "type": "string",
+      "enum": [
+        "oga",
+        "external"
+      ]
+    },
+    "default_provider": {
+      "type": "string",
+      "const": "oga"
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "description",
+        "prompt",
+        "normalized_prompt",
+        "expected_token_ids",
+        "expected_decoded_text",
+        "determinism"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prompt": {
+          "type": "string"
+        },
+        "normalized_prompt": {
+          "type": "string"
+        },
+        "expected_token_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "expected_decoded_text": {
+          "type": "string"
+        },
+        "determinism": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "temperature",
+            "top_p",
+            "max_new_tokens"
+          ],
+          "properties": {
+            "temperature": {
+              "type": "number",
+              "const": 0
+            },
+            "top_p": {
+              "type": "number",
+              "const": 1
+            },
+            "max_new_tokens": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "parity": {
+      "type": "object",
+      "additionalProperties": false,
+        "required": [
+          "status",
+          "equivalence_class",
+          "raw_byte_equal",
+          "valid_utf8",
+          "special_token_leakage",
+          "first_mismatch",
+          "normalization_applied",
+          "oga_provider",
+          "external_provider",
+          "oga_token_ids",
+          "external_token_ids",
+          "oga_decoded_text",
+        "external_decoded_text",
+        "notes"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "match",
+            "mismatch",
+            "error"
+          ]
+        },
+        "equivalence_class": {
+          "type": "string",
+          "enum": [
+            "byte_exact",
+            "canonical_equivalent",
+            "structured_equivalent",
+            "incompatible"
+          ]
+        },
+        "raw_byte_equal": {
+          "type": "boolean"
+        },
+        "valid_utf8": {
+          "type": "boolean"
+        },
+        "special_token_leakage": {
+          "type": "boolean"
+        },
+        "first_mismatch": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "byte_index",
+            "oga_text_window",
+            "external_text_window"
+          ],
+          "properties": {
+            "byte_index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "oga_text_window": {
+              "type": "string"
+            },
+            "external_text_window": {
+              "type": "string"
+            }
+          }
+        },
+        "normalization_applied": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "oga_provider": {
+          "type": "string",
+          "const": "oga"
+        },
+        "external_provider": {
+          "type": "string",
+          "const": "external"
+        },
+        "oga_token_ids": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "external_token_ids": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "oga_decoded_text": {
+          "type": "string"
+        },
+        "external_decoded_text": {
+          "type": "string"
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "detokenizer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "mode",
+        "input_token_ids",
+        "chunk_emissions",
+        "final_text",
+        "expected_text",
+        "notes"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "match",
+            "mismatch",
+            "error"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "const": "callback_cumulative"
+        },
+        "input_token_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "chunk_emissions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "token_ids",
+              "cumulative_text",
+              "emitted_text",
+              "final"
+            ],
+            "properties": {
+              "token_ids": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "cumulative_text": {
+                "type": "string"
+              },
+              "emitted_text": {
+                "type": "string"
+              },
+              "final": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "final_text": {
+          "type": "string"
+        },
+        "expected_text": {
+          "type": "string"
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

@@ -39,6 +39,11 @@ struct chat_parse_options {
     ///       before it is reasoning (as vLLM's DeepSeek-R1 parser has it). Until
     ///       either marker shows, a partial parse yields nothing.
     bool reasoning_may_close = false;
+    /// \brief retain literal content spacing for HIP OGA output
+    bool preserve_content_whitespace = false;
+    /// \brief treat JSON content as literal bytes after an optional reasoning block
+    bool json_content = false;
+    bool structured_auto = false;
 };
 
 /// \brief Parse the assistant output

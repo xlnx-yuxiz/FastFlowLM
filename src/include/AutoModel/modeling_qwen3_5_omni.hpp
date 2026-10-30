@@ -28,6 +28,7 @@
 /************              Qwen3_5_Omni            **************/
 class Qwen3_5_Omni : public AutoModel {
 public:
+	bool supports_common_sampling() const override { return false; }
     explicit Qwen3_5_Omni(flm_rt::device* npu_device_inst);
     ~Qwen3_5_Omni() override = default;
 

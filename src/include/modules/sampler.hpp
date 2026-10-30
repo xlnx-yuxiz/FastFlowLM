@@ -7,6 +7,7 @@
 #pragma once
 
 #include "typedef.hpp"
+#include "sampling/cpu_sampler.hpp"
 #include <cstdint>
 #include <deque>
 #include <random>
@@ -107,6 +108,13 @@ public:
     ///       so a shrunk window takes effect on the next token.
     void set_repeat_last_n(size_t n);
 
+    // The owner keeps this vector alive and updates it after each committed
+    // token/rewind. Common sampling never writes to the legacy penalty ring.
+    void configure_common(const flm::sampling::LogitsOptions& options,
+                          const std::vector<int>* logical_history, uint64_t seed);
+    void disable_common() { common_history_ = nullptr; }
+    void reset_common_seed(uint64_t seed) { common_sampler_.reset(seed); }
+
     /// \brief Reset the penalties
     /// \note The function will reset the penalties
     /// \note The function will reset the token positions
@@ -155,6 +163,11 @@ public:
 
     /// \brief Fill logprobs from this->logits, which must still hold the raw copy
     void raw_logprobs_apply(sample_logprobs_t& logprobs);
+
+private:
+    const std::vector<int>* common_history_ = nullptr;
+    flm::sampling::LogitsOptions common_options_;
+    flm::sampling::CpuSampler common_sampler_;
 };
 
 /// \brief Fill logprobs with the normaliser and top tokens of one row of raw logits

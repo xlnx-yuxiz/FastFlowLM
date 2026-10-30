@@ -49,6 +49,7 @@
 #include "models/hunyuan/flm/aie2p/hunyuan_npu.hpp"
 #include "tokenizer/tokenizer.hpp"
 #include "modules/sampler.hpp"
+#include "sampling/request.hpp"
 #include "utils/utils.hpp"
 #include "utils/profiler.hpp"
 #include "tensor_utils/q4_npu_eXpress.hpp"
@@ -186,6 +187,13 @@ protected:
 	causal_lm* lm_engine = nullptr;
 	std::unique_ptr<Tokenizer> tokenizer = nullptr;
 	std::unique_ptr<Sampler> sampler = nullptr;
+	std::unique_ptr<flm::sampling::SamplingState> sampling_state_;
+	virtual bool supports_common_sampling() const { return true; }
+	void begin_sampling_turn();
+	bool common_sampling_enabled() const {
+		return sampling_state_ && sampling_state_->provider() == flm::sampling::Provider::Common;
+	}
+	void _release_model_state() noexcept;
 	bool is_model_loaded = false;
 	std::string current_model = "";
 	std::vector<int> token_history;
@@ -432,6 +440,7 @@ public:
 	/// \brief Mark this instance as running under `flm serve` (vs. `flm run`)
 	/// \param value true if running under `flm serve`
 	void set_server_mode(bool value) { is_server_mode = value; }
+	void set_log_raw_output(bool value) { log_raw_output = value; }
 
 	/// \brief Get the current model
 	/// \return the current model
@@ -450,6 +459,8 @@ public:
 	/// \brief Set the sampler
 	/// \param sampler_config the sampler config
 	virtual void set_sampler(sampler_config& sampler_config);
+	virtual void set_sampling_provider(const std::string& name);
+	virtual void configure_sampling_request(const nlohmann::json& options, bool reset = true);
 
 	/// \brief Set the max length
 	/// \param MAX_L the max length
@@ -498,31 +509,31 @@ public:
 
 	/// \brief Set the topk
 	/// \param topk the topk
-	void set_topk(int topk);
+	virtual void set_topk(int topk);
 
 	/// \brief Set the topp
 	/// \param topp the topp
-	void set_topp(float topp);
+	virtual void set_topp(float topp);
 
 	/// \brief Set the minp
 	/// \param topp the minp
-	void set_minp(float minp);
+	virtual void set_minp(float minp);
 
 	/// \brief Set the temperature
 	/// \param temperature the temperature
-	void set_temperature(float temperature);
+	virtual void set_temperature(float temperature);
 
 	/// \brief Set the presencepenalty
 	/// \param presence_penalty the presence penalty
-	void set_presence_penalty(float presence_penalty);
+	virtual void set_presence_penalty(float presence_penalty);
 
 	/// \brief Set the repetition penalty
 	/// \param repetition_penalty the repetition penalty
-	void set_repetition_penalty(float repetition_penalty);
+	virtual void set_repetition_penalty(float repetition_penalty);
 
 	/// \brief Set the frequency penalty
 	/// \param frequency_penalty the frequency penalty
-	void set_frequency_penalty(float frequency_penalty);
+	virtual void set_frequency_penalty(float frequency_penalty);
 
 	/// \brief Set the frequency penalty window
 	/// \param frequency_penalty_window the frequency penalty window

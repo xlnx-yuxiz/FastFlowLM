@@ -2,7 +2,7 @@
 /// \brief The backend registry and the rules for picking a backend
 #include "AutoModel/model_backend.hpp"
 
-#include "utils/utils.hpp"
+#include "backend_options.hpp"
 
 #include <cstdlib>
 #include <set>
@@ -146,6 +146,7 @@ std::string resolve_backend_id(const std::string& family,
         chosen_source = "model catalog";
     }
 
+    chosen = canonical_backend_id(chosen);
     auto& registry = BackendRegistry::instance();
     if (!registry.has(family, chosen)) {
         throw std::runtime_error(

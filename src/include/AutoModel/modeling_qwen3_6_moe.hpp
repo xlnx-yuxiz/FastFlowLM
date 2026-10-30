@@ -52,6 +52,7 @@ private:
     void preprocess_image(qwen3_6_moe_image_t& image,  std::vector<bf16> &pixel_values);
 
 public:
+	bool supports_common_sampling() const override { return false; }
     Qwen3_6_MOE(flm_rt::device* npu_device_inst);
 
     void load_model(std::string model_path, json model_inf, int default_context_length = -1, bool enable_preemption = false, const std::string& backend = "") override;

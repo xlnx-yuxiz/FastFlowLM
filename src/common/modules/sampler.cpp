@@ -534,6 +534,23 @@ void raw_logprobs(const float* logits, int n, sample_logprobs_t& logprobs) {
 }
 
 int Sampler::sample(buffer<bf16>& x, const std::vector<uint32_t>* allowed, sample_logprobs_t* logprobs) {
+    if (common_history_) {
+        if (in_features <= 0 || x.size() < static_cast<std::size_t>(in_features))
+            throw std::invalid_argument("Common sampler logits row is too small");
+        std::vector<float> scores(static_cast<std::size_t>(in_features));
+        for (int i = 0; i < in_features; ++i) scores[i] = static_cast<float>(x[i]);
+        if (logprobs) raw_logprobs(scores.data(), in_features, *logprobs);
+        if (allowed) {
+            for (int i = 0; i < in_features; ++i) {
+                if (static_cast<std::size_t>(i / 32) >= allowed->size() ||
+                    !(((*allowed)[i / 32] >> (i % 32)) & 1u))
+                    scores[i] = -std::numeric_limits<float>::infinity();
+            }
+        }
+        return common_sampler_.sample(std::move(scores), common_history_->data(),
+                                      common_history_->size(), common_options_);
+    }
+
     // PRNG is seeded once at construction, no per-call seeding needed
     if (this->top_k == 1) {
         return sample_greedy(x, allowed, logprobs);
@@ -583,4 +600,12 @@ int Sampler::sample(buffer<bf16>& x, const std::vector<uint32_t>* allowed, sampl
     ring_buffer_update_sparse(sampled_index);
 
     return sampled_index;
+}
+
+void Sampler::configure_common(const flm::sampling::LogitsOptions& options,
+                               const std::vector<int>* logical_history, uint64_t seed) {
+    if (!logical_history) throw std::invalid_argument("Common sampler requires logical history");
+    common_options_ = options;
+    common_history_ = logical_history;
+    common_sampler_.reset(seed);
 }

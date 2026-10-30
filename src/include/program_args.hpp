@@ -20,7 +20,11 @@ struct program_args_t {
     std::string decision = ""; // --decision <tag>: serve a decision model (POST /v1/systemone)
     bool json_output = false;
     int ctx_length = -1; // let model decide
-    std::string backend = ""; // let the catalog decide; see AutoModel/model_backend.hpp
+    std::string backend = ""; // empty selects the catalog backend; npu aliases flm; hip uses OGA
+    std::string hip_oga_text_codec;
+    std::string sampler = "backend";
+    std::string hip_oga_tokenizer;
+    std::string hip_oga_decoder;
     int prefill_chunk_len = -1; // let model decide
     int prefix_cache_mb = -1;   // host memory (MiB) for saved prompt snapshots; -1 = the model's default
     int prefix_slots = -1;      // how many prompt snapshots to keep; -1 = the model's default, 0 = off
@@ -28,6 +32,12 @@ struct program_args_t {
 
     // handling input file
     std::string input_file_name = "";
+    int max_tokens = -1;
+    std::string tools_file;
+    std::string tools_choice = "required";
+    std::string tool_executor;
+    std::string tool_data_dir;
+    int max_tool_turns = 8;
     int iterations = 2;
 
     // specific commands

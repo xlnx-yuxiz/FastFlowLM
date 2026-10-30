@@ -1,15 +1,16 @@
 /// \file test_model_backend.cpp
 /// \brief The backend registry and the rules for picking a backend
 /// \note  Deliberately free of NPU hardware and of any prebuilt engine library:
-///        every backend here is a stub, so this builds and runs on Linux CI
-///        where the phi4_core suite cannot. register_builtin_backends
+///        every backend here is a stub. Compilation uses the same runtime
+///        headers as the CLI; execution needs no NPU hardware. register_builtin_backends
 ///        is stubbed out below for the same reason.
 /// \note  A backend id names a kernel provider: "flm", "core", and one day
 ///        whatever else grows an engine. It is not a platform id -- the
 ///        resolution rules below are about which provider a build links,
 ///        not about which silicon it runs on.
 #include "AutoModel/model_backend.hpp"
-#include "../phi4_core/test_support.hpp"
+#include "AutoModel/hip_oga_backend.hpp"
+#include "test_support.hpp"
 
 #include <cstdlib>
 #include <memory>
@@ -53,6 +54,52 @@ flm::backend::BackendFactory StubFactory(std::string id) {
     return [id = std::move(id)](const BackendContext&) {
         return std::make_unique<StubBackend>(id);
     };
+}
+
+// No device allocations: exercise the returned owner's engine lifetime even
+// after the factory registry itself has gone away.
+class CountingEngine final : public causal_lm {
+public:
+    explicit CountingEngine(int& live) : live_(live) { ++live_; }
+    ~CountingEngine() override { --live_; }
+    buffer<bf16> forward(int) override { return {}; }
+    buffer<bf16> prefill(std::vector<int>&, void*) override { return {}; }
+    void set_context_length(int) override {}
+    void load_weights(Q4NX&) override {}
+    void update_max_length(uint32_t) override {}
+    void clear_context() override {}
+    buffer<bf16> get_k_cache(int, int) override { return {}; }
+    buffer<bf16> get_v_cache(int, int) override { return {}; }
+    int get_current_context_length() override { return 42; }
+    int checkpoint() override { return 0; }
+    int restore() override { return 0; }
+private:
+    int& live_;
+};
+class OwningBackend final : public ModelBackend {
+public:
+    explicit OwningBackend(int& live) : engine_(std::make_unique<CountingEngine>(live)) {}
+    causal_lm& engine() override { return *engine_; }
+    std::string id() const override { return "counting"; }
+private:
+    std::unique_ptr<CountingEngine> engine_;
+};
+
+void test_created_backend_owns_engine_beyond_registry() {
+    int live = 0;
+    std::unique_ptr<ModelBackend> owner;
+    {
+        BackendRegistry registry;
+        registry.register_backend("test", "counting", [&live](const BackendContext&) {
+            return std::make_unique<OwningBackend>(live);
+        });
+        owner = registry.create("test", "counting", BackendContext{});
+        TEST_REQUIRE(live == 1);
+    }
+    TEST_REQUIRE(live == 1);
+    TEST_REQUIRE(owner->engine().get_current_context_length() == 42);
+    owner.reset();
+    TEST_REQUIRE(live == 0);
 }
 
 /// \brief a registry that is not the process-wide one
@@ -280,7 +327,31 @@ void test_resolution_rejects_with_a_readable_message() {
 
 }  // namespace
 
+void test_npu_alias_keeps_explicit_precedence() {
+    auto& registry = BackendRegistry::instance();
+    registry.replace_backend("alias-family", "flm", StubFactory("flm"));
+    registry.replace_backend("alias-family", "hip", StubFactory("hip"));
+    ScopedBackendEnv env("hip");
+    std::string source;
+    TEST_REQUIRE(resolve_backend_id("alias-family", "hip", "npu", &source) == "flm");
+    TEST_REQUIRE(source == "--backend");
+    TEST_REQUIRE(resolve_backend_id("alias-family", "flm") == "hip");
+}
+
+void test_hip_family_fallback_keeps_custom_catalogs() {
+    BackendRegistry registry;
+    registry.register_backend("hip-oga", "hip", StubFactory("hip"));
+    registry.register_backend("gemma3", "hip", StubFactory("hip"));
+    TEST_REQUIRE(flm::backend::hip_oga_backend_family(registry, "gemma3") == "gemma3");
+    TEST_REQUIRE(flm::backend::hip_oga_backend_family(registry, "custom-family") == "hip-oga");
+    BackendRegistry unavailable;
+    RequireThrows([&] { flm::backend::hip_oga_backend_family(unavailable, "custom-family"); });
+}
+
 int main() {
+    RunTest(test_created_backend_owns_engine_beyond_registry, "backend owns engine beyond registry lifetime");
+    RunTest(test_npu_alias_keeps_explicit_precedence, "npu alias preserves explicit precedence");
+    RunTest(test_hip_family_fallback_keeps_custom_catalogs, "generic OGA family preserves custom catalogs");
     RunTest(test_register_and_create, "register and create");
     RunTest(test_traits_are_kept_per_backend, "traits are kept per backend");
     RunTest(test_backend_defaults, "backend policy defaults");

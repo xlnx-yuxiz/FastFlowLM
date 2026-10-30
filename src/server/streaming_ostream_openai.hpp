@@ -20,6 +20,7 @@
 #include "prefix_cache_usage.hpp"
 #include "AutoModel/automodel.hpp"
 #include "chat/chat_stream.hpp"
+#include "chat/chat_output.hpp"
 #include "chat_logprobs.hpp"
 
 using json = nlohmann::ordered_json;
@@ -314,6 +315,11 @@ public:
         const chat_format_spec& spec = auto_chat_engine->get_chat_format();
         stream = std::make_unique<chat_stream>(
             spec, chat_format_prefill(spec, meta_info.prompt_tail, meta_info.continue_final_message), parse_options);
+        if (auto_chat_engine->backend_id() == "hip") {
+            strict_output = std::make_unique<chat_output>(spec, chat_format_prefill(spec, meta_info.prompt_tail),
+                parse_options.tools ? *parse_options.tools : json::array(), true,
+                parse_options.parse_tool_calls, parse_options.json_content, parse_options.structured_auto);
+        }
         if (meta_info.logprobs_top_n >= 0) {
             logprobs = std::make_unique<chat_logprobs_aligner>(auto_chat_engine, meta_info.logprobs);
         }
@@ -356,7 +362,7 @@ public:
         // Only promote to a tool-call finish reason on an otherwise clean stop;
         // length/cancel/error must win, so a truncated or aborted generation is
         // never reported to the client as a complete tool call.
-        if (stream && !stream->message().tool_calls.empty()
+        if ((strict_has_tools || (stream && !stream->message().tool_calls.empty()))
             && meta_info.stop_reason == stop_reason_t::EOT_DETECTED) {
             meta_info.stop_reason = stop_reason_t::TOOL_DETECTED;
         }
@@ -474,7 +480,16 @@ private:
             // start() was skipped; parse as if nothing was prefilled
             stream = std::make_unique<chat_stream>(auto_chat_engine->get_chat_format(), "", parse_options);
         }
-        for (const chat_msg_delta& d : stream->update(content, generation_done)) {
+        std::vector<chat_msg_delta> deltas;
+        if (strict_output) {
+            auto result = strict_output->update(content, generation_done);
+            if (!result.error.empty()) throw ModelRequestError(422, true, result.error, "model_output_error");
+            strict_has_tools = !result.message.tool_calls.empty();
+            deltas = std::move(result.deltas);
+        } else {
+            deltas = stream->update(content, generation_done);
+        }
+        for (const chat_msg_delta& d : deltas) {
             json delta = {{"role", "assistant"}};
             // only content has logprobs; reasoning and tool calls go out with null
             json choice_logprobs = nullptr;
@@ -602,6 +617,8 @@ private:
     chat_parse_options parse_options;
     ///@brief Parse state of this response, created by start()
     std::unique_ptr<chat_stream> stream;
+    std::unique_ptr<chat_output> strict_output;
+    bool strict_has_tools = false;
     ///@brief Set by start() when the request asks for logprobs
     std::unique_ptr<chat_logprobs_aligner> logprobs;
     ///@brief What the model wrote since the last flush, for logprobs

@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <vector>
 #include "program_args.hpp"
+#include "AutoModel/hip_oga_codec_options.hpp"
+#include "sampling/request.hpp"
 
 namespace arg_utils {
 
@@ -98,7 +100,15 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
             ("ctx-len,c", po::value<int>(&parsed_args.ctx_length)->default_value(-1),
              "Set context length")
             ("backend", po::value<std::string>(&parsed_args.backend)->default_value(""),
-             "Execution backend to run the model on (default: the model's own). Overrides FLM_BACKEND")
+             "Execution backend (default: the model catalog). Overrides FLM_BACKEND; npu aliases flm; hip requires FLM_ENABLE_HIP_OGA")
+            ("hip-oga-text-codec", po::value<std::string>(&parsed_args.hip_oga_text_codec),
+             "HIP text tokenizer and decoder: oga (default), flm, compare, external (legacy checked FLM)")
+            ("sampler", po::value<std::string>(&parsed_args.sampler)->default_value("backend"),
+             "Sampling provider for run/serve: backend (compatibility default) or common (CPU reference)")
+            ("hip-oga-tokenizer", po::value<std::string>(&parsed_args.hip_oga_tokenizer),
+             "Override HIP text tokenizer: oga, flm, compare, external (legacy)")
+            ("hip-oga-decoder", po::value<std::string>(&parsed_args.hip_oga_decoder),
+             "Override HIP text decoder: oga, flm, compare, external (legacy)")
             ("prefill-chunk-len,pcl", po::value<int>(&parsed_args.prefill_chunk_len)->default_value(-1),
              "Set prefill chunk length")
             ("prefix-cache-mb", po::value<int>(&parsed_args.prefix_cache_mb)->default_value(-1),
@@ -119,7 +129,19 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
             ("preemption", po::value<bool>(&parsed_args.preemption)->default_value(false),
              "Enable preemption")
             ("prompt,i", po::value<std::string>(&parsed_args.input_file_name)->default_value(""),
-             "Direct file input")
+             "Prompt text for run, or benchmark config path for bench")
+            ("max-tokens", po::value<int>(&parsed_args.max_tokens)->default_value(-1),
+             "Maximum generated tokens for a non-interactive run prompt")
+            ("tools", po::value<std::string>(&parsed_args.tools_file),
+             "OpenAI tool definitions JSON for run (HIP backend); prints selected tool calls")
+            ("tool-executor", po::value<std::string>(&parsed_args.tool_executor),
+             "Execute registered demo tools and complete the loop: demo")
+            ("tool-data-dir", po::value<std::string>(&parsed_args.tool_data_dir),
+             "Data directory for the demo tool executor (default: data beside the tools file)")
+            ("max-tool-turns", po::value<int>(&parsed_args.max_tool_turns)->default_value(8),
+             "Maximum tool rounds with --tool-executor demo (1..12)")
+            ("tool-choice", po::value<std::string>(&parsed_args.tools_choice)->default_value("required"),
+             "Tool selection: required (default) or auto (call tools when needed, or answer directly)")
             ("bench-iterations", po::value<int>(&parsed_args.iterations)->default_value(2),
              "Iterations for bench");
 
@@ -145,6 +167,17 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
                   .positional(pos_desc)
                   .run(), vm);
         po::notify(vm);
+        (void)flm::sampling::parse_provider(parsed_args.sampler);
+
+        for (const char* option : {"hip-oga-text-codec", "hip-oga-tokenizer", "hip-oga-decoder"}) {
+            if (vm.count(option)) {
+                const auto value = vm[option].as<std::string>();
+                if (flm::hip_oga::normalize_selector_name(value).empty()) {
+                    throw std::invalid_argument(std::string("--") + option + " requires a nonempty mode");
+                }
+                (void)flm::hip_oga::parse_text_codec_selector(value);
+            }
+        }
 
         // Help has highest priority
         if (vm.count("help")) {
@@ -156,6 +189,16 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
         if (vm.count("version")) {
             parsed_args.command = "version";
             return true;
+        }
+
+        const bool tool_flags = vm.count("tools") || vm.count("tool-executor") ||
+            vm.count("tool-data-dir") || !vm["max-tool-turns"].defaulted() || !vm["tool-choice"].defaulted();
+        if (tool_flags) {
+            if (parsed_args.command != "run" || parsed_args.tools_file.empty())
+                throw std::invalid_argument("Tool options require flm run --tools FILE");
+            if ((!parsed_args.tool_data_dir.empty() || !vm["max-tool-turns"].defaulted()) &&
+                parsed_args.tool_executor != "demo")
+                throw std::invalid_argument("--tool-data-dir/--max-tool-turns require --tool-executor demo");
         }
 
         // Extract command
@@ -223,6 +266,11 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
         // }
 
         // Note: serve command allows empty model_tag (will use default)
+
+        if (!vm["max-tokens"].defaulted() && parsed_args.max_tokens < 1) {
+            std::cerr << "Error: --max-tokens must be at least 1" << std::endl;
+            return false;
+        }
 
         // Validate power mode for run/serve commands
         if ((parsed_args.command == "run" || parsed_args.command == "serve") && 

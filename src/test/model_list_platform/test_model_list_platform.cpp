@@ -260,6 +260,7 @@ void test_shipped_catalog_is_well_formed() {
     for (const auto& [family, sizes] : catalog.at("models").items()) {
         const bool core_family = family.size() > 5 &&
                                  family.compare(family.size() - 5, 5, "-core") == 0;
+        const bool hip_family = family.rfind("hip-", 0) == 0;
         for (const auto& [size, entry] : sizes.items()) {
             const std::string tag = family + ":" + size;
 
@@ -289,13 +290,19 @@ void test_shipped_catalog_is_well_formed() {
             std::set<std::string> named;
             for (const auto& value : supported) {
                 if (!value.is_string() ||
-                    !utils::parse_platform(value.get<std::string>()).has_value()) {
+                    (value.get<std::string>() != "amdgpu" &&
+                     !utils::parse_platform(value.get<std::string>()).has_value())) {
                     throw std::runtime_error(
                         tag + ": unknown platform in supported_platforms");
                 }
                 named.insert(value.get<std::string>());
             }
             TEST_REQUIRE(named.size() <= kAllPlatforms.size());
+
+            if (hip_family) {
+                TEST_REQUIRE(named == std::set<std::string>{"amdgpu"});
+                continue;
+            }
 
             // corelib runs on the next generation and the FastFlowLM kernels on
             // what is shipping, so a tag that says one and a platform key that

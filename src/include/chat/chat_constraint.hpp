@@ -30,6 +30,8 @@ struct chat_constraint_request {
     bool parallel_tool_calls = true;
     bool allow_reasoning = true;                    // false when the request turned thinking off
     bool json_object = false;                       // response_format {"type": "json_object"}
+    bool structured_auto = false;
+    bool strict_schema = false;                   // explicit tool_routing="structured"
     nlohmann::ordered_json json_schema;             // response_format json_schema's schema, null if none
 };
 
@@ -50,7 +52,7 @@ class chat_grammar_engine;
 /// \return false on a malformed field
 bool chat_constraint_request_from_openai(const nlohmann::ordered_json& request,
                                          const nlohmann::ordered_json& tools,
-                                         chat_constraint_request& out, std::string& error);
+                                         chat_constraint_request& out, std::string& error, bool strict_schema = false);
 
 /// \brief Build the constraint for one request
 /// \param grammar_engine returns the model's grammar engine, only called when a grammar is needed

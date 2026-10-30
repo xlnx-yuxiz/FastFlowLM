@@ -103,7 +103,18 @@ json normalize_schema(json schema) {
         schema["items"] = json::object();
     }
     for (auto& [key, value] : schema.items()) {
-        if (value.is_object() || value.is_array()) {
+        // Visit schemas only: const, enum, default and examples contain data.
+        // Map keys are property names, even when named after schema keywords.
+        if (key == "properties" || key == "patternProperties" || key == "$defs" ||
+            key == "definitions" || key == "dependentSchemas" || key == "dependencies") {
+            if (value.is_object()) {
+                for (auto& [name, child] : value.items()) child = normalize_schema(std::move(child));
+            }
+        } else if (key == "items" || key == "prefixItems" || key == "additionalItems" ||
+                   key == "additionalProperties" || key == "unevaluatedProperties" ||
+                   key == "unevaluatedItems" || key == "contains" || key == "propertyNames" ||
+                   key == "allOf" || key == "anyOf" || key == "oneOf" || key == "not" ||
+                   key == "if" || key == "then" || key == "else") {
             value = normalize_schema(std::move(value));
         }
     }
@@ -134,9 +145,10 @@ std::vector<tool_def> request_tools(const chat_constraint_request& request) {
             continue;
         }
         // as xgrammar does: no schema, or a non-strict tool, still gets well formed arguments
-        const bool strict = fn.value("strict", true);
+        const bool strict = request.structured_auto || !fn.contains("strict") || fn["strict"].is_null() || fn["strict"].get<bool>();
         tool.parameters = strict && fn.contains("parameters") && fn["parameters"].is_object()
-            ? normalize_schema(fn["parameters"]) : json(true);
+            ? normalize_schema(fn["parameters"]) : (request.strict_schema ? json{{"type", "object"}} : json(true));
+        if (request.structured_auto && tool.parameters.empty()) tool.parameters = {{"type", "object"}};
         tools.push_back(std::move(tool));
     }
     return tools;
@@ -454,14 +466,14 @@ public:
     /// \param with_reasoning when the grammar leaves reasoning out, the same grammar with
     ///        it: a model made to open a reasoning block switches to this one
     xgrammar_constraint(const xgrammar::CompiledGrammar& grammar, std::optional<xgrammar::CompiledGrammar> with_reasoning,
-                        std::string prefill_skip, size_t vocab_size)
+                        std::string prefill_skip, size_t vocab_size, bool ignore_prefill, bool strict_schema)
         : matcher_(grammar, std::nullopt, false, MAX_ROLLBACK),
           with_reasoning_(std::move(with_reasoning)),
           skip_(std::move(prefill_skip)),
-          words_((vocab_size + 31) / 32) {}
+          words_((vocab_size + 31) / 32), ignore_prefill_(ignore_prefill), strict_schema_(strict_schema) {}
 
     void start(const std::string& prefill) override {
-        std::string text = prefill;
+        std::string text = ignore_prefill_ ? "" : prefill;
         if (!skip_.empty() && text.compare(0, skip_.size(), skip_) == 0) {
             text = text.substr(skip_.size());
         }
@@ -549,7 +561,9 @@ private:
     }
 
     void give_up(const std::string& why) {
-        // a desynchronised grammar would only produce garbage; let the model finish free
+        // A requested constraint is a contract. Abort rather than emit an
+        // unconstrained continuation after a tokenizer/matcher mismatch.
+        if (strict_schema_) throw std::runtime_error("Constrained decoding failed: " + why);
         header_print("WARNING", "Constrained decoding disabled for this request: " << why);
         failed_ = true;
     }
@@ -560,6 +574,8 @@ private:
     std::string prefill_;
     std::vector<int> history_;  // accepted tokens, to replay into with_reasoning_
     size_t words_;
+    bool ignore_prefill_;
+    bool strict_schema_;
     bool failed_ = false;
 };
 
@@ -607,7 +623,27 @@ std::vector<std::string> encoded_vocab(const nlohmann::json& tokenizer) {
 } // namespace
 
 json chat_structural_tag(const chat_format_spec& spec, const chat_constraint_request& request) {
-    const std::vector<tool_def> tools = request_tools(request);
+    if (request.strict_schema && spec.kind != chat_format_kind::CONTENT_ONLY && spec.kind != chat_format_kind::HERMES_JSON)
+        throw std::invalid_argument("Constrained output is not qualified for this model's chat format");
+    // response_format selects a JSON response; optional auto-tool metadata is
+    // irrelevant to that grammar. Required/named combinations fail admission.
+    const std::vector<tool_def> tools = request.strict_schema && has_response_format(request)
+        ? std::vector<tool_def>{} : request_tools(request);
+    if (request.structured_auto) {
+        if (spec.kind != chat_format_kind::HERMES_JSON || spec.reasoning_forced || tools.empty())
+            throw std::invalid_argument("Structured tool routing requires a supported text Hermes model");
+        // The pinned JSON-schema length rule excludes escape sequences. Use an
+        // explicit nonempty JSON string so answers can contain quotes, newlines
+        // and JSON without silently removing those continuations from the mask.
+        const auto message_string = grammar_content(R"(root ::= "\"" ([^"\\\x00-\x1f] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4}))+ "\"")");
+        std::vector<json> branches{tag("{\"type\": \"message\", \"content\": ", message_string, "}")};
+        for (const auto& tool : tools) {
+            branches.push_back(tag("{\"type\": \"tool_call\", \"name\": " + json(tool.name).dump() +
+                ", \"arguments\": ", schema_content(tool.parameters), "}"));
+        }
+        return {{"type", "structural_tag"}, {"format", sequence({whitespace(),
+            json{{"type", "or"}, {"elements", branches}}, whitespace()})}};
+    }
     // auto only constrains a format that has a call syntax; required and forced
     // calls on one that has none are an error below
     const bool tool_grammar = request.tool_choice == chat_tool_choice::REQUIRED ||
@@ -709,13 +745,14 @@ std::shared_ptr<decode_constraint> chat_grammar_engine::make(const chat_format_s
     // thinking turned off keeps reasoning out of the grammar, so no spelling of the
     // opener can be sampled; a thinking-only model is still made to open it
     std::optional<xgrammar::CompiledGrammar> with_reasoning;
-    if (!request.allow_reasoning && spec.has_reasoning() && !spec.reasoning_forced) {
+    if (!request.structured_auto && !request.allow_reasoning && spec.has_reasoning() && !spec.reasoning_forced) {
         chat_constraint_request reasoning_request = request;
         reasoning_request.allow_reasoning = true;
         with_reasoning = compile(chat_structural_tag(spec, reasoning_request));
     }
     try {
-        return std::make_shared<xgrammar_constraint>(grammar, with_reasoning, prefill_skip(spec), impl_->vocab_size);
+        return std::make_shared<xgrammar_constraint>(grammar, with_reasoning, prefill_skip(spec),
+                                                     impl_->vocab_size, request.structured_auto, request.strict_schema);
     } catch (const std::exception& e) {
         throw std::invalid_argument("cannot start the decoding grammar: " + client_message(e.what()));
     }
@@ -728,7 +765,7 @@ bool chat_grammar_engine::accepts(const chat_format_spec& spec, const chat_const
         return true;
     }
     xgrammar::GrammarMatcher matcher(impl_->compiler->CompileStructuralTag(structural_tag.dump()));
-    std::string full = prefill;
+    std::string full = request.structured_auto ? "" : prefill;
     const std::string skip = prefill_skip(spec);
     if (!skip.empty() && full.compare(0, skip.size(), skip) == 0) {
         full = full.substr(skip.size());
@@ -745,6 +782,10 @@ bool chat_grammar_engine::accepts(const chat_format_spec& spec, const chat_const
             return false;
         }
         pos += n;
+    }
+    if (!matcher.IsCompleted()) {
+        error = "incomplete constrained output";
+        return false;
     }
     return true;
 }

@@ -96,7 +96,12 @@ struct text_parts {
     }
 
     /// \param is_final no more text follows, so trailing whitespace can be released
-    std::string join(bool is_final = false) const {
+    std::string join(bool is_final = false, bool preserve_whitespace = false) const {
+        if (preserve_whitespace) {
+            std::string exact;
+            for (const auto& part : parts) exact += part.raw;
+            return exact;
+        }
         const bool others = std::any_of(parts.begin(), parts.end(),
                                         [](const part_t& p) { return !p.exact && !trim(p.raw).empty(); });
         std::string out;
@@ -571,7 +576,7 @@ chat_msg parse_tagged(const chat_format_spec& spec, const std::string& full_text
     }
 
     msg.reasoning = reasoning.join(!is_partial);
-    msg.content = content.join(!is_partial);
+    msg.content = content.join(!is_partial, options.preserve_content_whitespace);
     if (!msg.tool_calls.empty() && trim(msg.content).empty()) {
         msg.content.clear(); // whitespace before a call is layout, kept only as a whole answer
     }
@@ -667,7 +672,32 @@ chat_msg parse_harmony(const std::string& text, bool is_partial, const chat_pars
     }
 
     msg.reasoning = reasoning.join();
-    msg.content = content.join();
+    msg.content = content.join(false, options.preserve_content_whitespace);
+    return msg;
+}
+
+chat_msg parse_json_content(const chat_format_spec& spec, const std::string& text, bool partial) {
+    chat_msg msg;
+    msg.content = text;
+    if (!spec.has_reasoning()) return msg;
+    const size_t first = skip_ws(text, 0);
+    const size_t available = text.size() - first;
+    if (partial && available < spec.reasoning_start.size() &&
+        spec.reasoning_start.compare(0, available, text, first, available) == 0) {
+        msg.content = text.substr(0, first);
+        return msg;
+    }
+    if (!starts_with_at(text, first, spec.reasoning_start)) return msg;
+    const size_t begin = first + spec.reasoning_start.size();
+    const size_t end = text.find(spec.reasoning_end, begin);
+    msg.content = text.substr(0, first);
+    if (end == npos) {
+        msg.reasoning = text.substr(begin);
+        if (partial) msg.reasoning = cut_partial_marker(msg.reasoning, {&spec.reasoning_end});
+    } else {
+        msg.reasoning = text.substr(begin, end - begin);
+        msg.content += text.substr(end + spec.reasoning_end.size());
+    }
     return msg;
 }
 
@@ -675,6 +705,7 @@ chat_msg parse_harmony(const std::string& text, bool is_partial, const chat_pars
 
 chat_msg chat_parse(const chat_format_spec& spec, const std::string& text, bool is_partial,
                     const chat_parse_options& options) {
+    if (options.json_content) return parse_json_content(spec, text, is_partial);
     if (spec.kind == chat_format_kind::HARMONY) {
         return parse_harmony(text, is_partial, options);
     }

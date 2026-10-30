@@ -11,6 +11,7 @@ set(FLM_CHAT_SOURCES
     "${CMAKE_CURRENT_LIST_DIR}/chat_format.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/chat_grammar.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/chat_msg.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/chat_output.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/chat_parser.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/chat_stream.cpp")
 
@@ -23,9 +24,15 @@ if(NOT TARGET flm_xgrammar)
     get_filename_component(XGRAMMAR_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../third_party/xgrammar" ABSOLUTE)
     file(GLOB_RECURSE XGRAMMAR_SOURCES ${XGRAMMAR_DIR}/cpp/*.cc)
     list(FILTER XGRAMMAR_SOURCES EXCLUDE REGEX "/cpp/tvm_ffi/.*\\.cc$")
+    include("${CMAKE_CURRENT_LIST_DIR}/xgrammar_string_bounds.cmake")
+    set(FLM_XGRAMMAR_CONVERTER "${CMAKE_CURRENT_BINARY_DIR}/flm_xgrammar/json_schema_converter.cc")
+    flm_patch_xgrammar_string_bounds("${XGRAMMAR_DIR}/cpp/json_schema_converter.cc" "${FLM_XGRAMMAR_CONVERTER}")
+    list(REMOVE_ITEM XGRAMMAR_SOURCES "${XGRAMMAR_DIR}/cpp/json_schema_converter.cc")
+    list(APPEND XGRAMMAR_SOURCES "${FLM_XGRAMMAR_CONVERTER}")
     add_library(flm_xgrammar STATIC ${XGRAMMAR_SOURCES})
     target_compile_features(flm_xgrammar PUBLIC cxx_std_17)
     target_include_directories(flm_xgrammar PUBLIC ${XGRAMMAR_DIR}/include)
+    target_include_directories(flm_xgrammar PRIVATE ${XGRAMMAR_DIR}/cpp)
     target_include_directories(flm_xgrammar SYSTEM PUBLIC
         ${XGRAMMAR_DIR}/3rdparty/picojson
         ${XGRAMMAR_DIR}/3rdparty/dlpack/include)

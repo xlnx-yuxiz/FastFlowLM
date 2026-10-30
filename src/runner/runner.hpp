@@ -15,6 +15,7 @@
 #include "model_downloader.hpp"
 #include "cli_wide.hpp"
 #include "program_args.hpp"
+#include "chat/cli_tools.hpp"
 #include "image/image_reader.hpp"
 #ifndef FASTFLOWLM_LINUX_LIMITED_MODELS
 #include "whisper/modeling_whisper.hpp"
@@ -50,6 +51,8 @@ class Runner {
         void run();
     private:
         std::string tag;
+        std::string initial_prompt;
+        std::unique_ptr<flm::chat::cli_tools_session> tool_session;
         bool modelscope;
         int prefill_chunk_len;
         bool asr;
@@ -66,16 +69,17 @@ class Runner {
         int ctx_length;
         std::string system_prompt;
         bool preemption;
-        /// \brief the --backend value, empty when the flag was not given
         std::string backend;
+        std::string sampler_provider;
         int img_pre_resize;
         // CLI instance for interactive input
         CLIWide cli;
-        // Non-RAI: Runner owns the device. RAI: main passes corelib's device.
-        flm_rt::device* npu_device_inst;
-        // Non-RAI path: Runner owns the device so constructor errors propagate
-        // to main()'s try-catch.
-        std::optional<flm_rt::device> owned_device;
+        std::unique_ptr<flm_rt::device> npu_device_inst;
+        flm_rt::device* borrowed_npu_device = nullptr;
+
+        flm_rt::device* ensure_npu_device();
+        bool generate_tools(const std::string& input, std::ostream& output);
+        bool generate_once(const std::string& input, std::ostream& base_ostream);
 
         /// \brief Command functions
         void cmd_set(std::vector<std::string>& input_list);

@@ -24,6 +24,7 @@ private:
     }
 
 public:
+	bool supports_common_sampling() const override { return false; }
     LFM2(flm_rt::device* npu_device_inst);
 
     void load_model(std::string model_path, json model_inf, int default_context_length = -1, bool enable_preemption = false, const std::string& backend = "") override;

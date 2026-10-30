@@ -48,6 +48,109 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 # ———————————————————————————————————————————————
 option(FLM_USE_HRX "Use the HRX amdxdna NPU runtime instead of XRT (0=XRT default, 1=HRX)" OFF)
 option(FLM_PORTABLE_BUILD "Build portable distribution with bundled runtime libraries" OFF)
+option(FLM_ENABLE_HIP_OGA
+       "Build the prototype ONNX Runtime GenAI backend for HIP EP/AMDGPU" OFF)
+if(FLM_HIP_OGA_ONLY)
+    message(FATAL_ERROR "FLM_HIP_OGA_ONLY was removed because it produced a run-only flm.exe without serve/check/list support. Build the normal FastFlowLM target with -DFLM_ENABLE_HIP_OGA=ON and force --backend hip at runtime.")
+endif()
+
+set(ONNXRUNTIME_GENAI_HOME "" CACHE PATH "ONNX Runtime GenAI install root")
+set(OGA_HOME "" CACHE PATH "ONNX Runtime GenAI install root alias")
+
+function(flm_find_ort_genai)
+    set(_flm_oga_roots
+        "${ONNXRUNTIME_GENAI_HOME}"
+        "${OGA_HOME}"
+        "$ENV{ONNXRUNTIME_GENAI_HOME}"
+        "$ENV{OGA_HOME}"
+        "$ENV{CONDA_PREFIX}")
+
+    find_path(ORT_GENAI_INCLUDE_DIR
+        NAMES ort_genai.h
+        HINTS ${_flm_oga_roots}
+        PATH_SUFFIXES include
+        REQUIRED)
+    find_library(ORT_GENAI_LIBRARY
+        NAMES onnxruntime-genai onnxruntime_genai
+        HINTS ${_flm_oga_roots}
+        PATH_SUFFIXES lib
+        REQUIRED)
+    set(ORT_GENAI_INCLUDE_DIR "${ORT_GENAI_INCLUDE_DIR}" PARENT_SCOPE)
+    set(ORT_GENAI_LIBRARY "${ORT_GENAI_LIBRARY}" PARENT_SCOPE)
+    message(STATUS "Found ONNX Runtime GenAI include dir: ${ORT_GENAI_INCLUDE_DIR}")
+    message(STATUS "Found ONNX Runtime GenAI library: ${ORT_GENAI_LIBRARY}")
+
+    if(WIN32)
+        find_file(ORT_GENAI_RUNTIME_DLL
+            NAMES onnxruntime-genai.dll onnxruntime_genai.dll
+            HINTS ${_flm_oga_roots}
+            PATH_SUFFIXES bin lib
+            NO_DEFAULT_PATH
+            REQUIRED)
+        find_file(ORT_RUNTIME_DLL
+            NAMES onnxruntime.dll
+            HINTS ${_flm_oga_roots}
+            PATH_SUFFIXES bin lib
+            NO_DEFAULT_PATH
+            REQUIRED)
+        find_file(ORT_PROVIDERS_SHARED_RUNTIME_DLL
+            NAMES onnxruntime_providers_shared.dll
+            HINTS ${_flm_oga_roots}
+            PATH_SUFFIXES bin lib
+            NO_DEFAULT_PATH
+            REQUIRED)
+        find_file(AMDGPU_EP_RUNTIME_DLL
+            NAMES amdgpu-ep.dll
+            HINTS ${_flm_oga_roots}
+            PATH_SUFFIXES bin lib
+            NO_DEFAULT_PATH
+            REQUIRED)
+        find_file(HIP_BACKEND_RUNTIME_DLL
+            NAMES hip-backend.dll
+            HINTS ${_flm_oga_roots}
+            PATH_SUFFIXES bin lib
+            NO_DEFAULT_PATH
+            REQUIRED)
+
+        set(ORT_GENAI_RUNTIME_DLLS
+            "${ORT_GENAI_RUNTIME_DLL}"
+            "${ORT_RUNTIME_DLL}"
+            "${ORT_PROVIDERS_SHARED_RUNTIME_DLL}"
+            "${AMDGPU_EP_RUNTIME_DLL}"
+            "${HIP_BACKEND_RUNTIME_DLL}")
+        set(ORT_GENAI_RUNTIME_DIRS "")
+        foreach(_flm_runtime_dll ${ORT_GENAI_RUNTIME_DLLS})
+            get_filename_component(_flm_runtime_dir "${_flm_runtime_dll}" DIRECTORY)
+            list(APPEND ORT_GENAI_RUNTIME_DIRS "${_flm_runtime_dir}")
+        endforeach()
+        list(REMOVE_DUPLICATES ORT_GENAI_RUNTIME_DIRS)
+        set(ORT_GENAI_RUNTIME_DLLS "${ORT_GENAI_RUNTIME_DLLS}" PARENT_SCOPE)
+        set(ORT_GENAI_RUNTIME_DIRS "${ORT_GENAI_RUNTIME_DIRS}" PARENT_SCOPE)
+        message(STATUS "Found ONNX Runtime GenAI runtime dirs: ${ORT_GENAI_RUNTIME_DIRS}")
+    else()
+        get_filename_component(_flm_ort_genai_lib_dir "${ORT_GENAI_LIBRARY}" DIRECTORY)
+        set(ORT_GENAI_RUNTIME_DIRS "${_flm_ort_genai_lib_dir}" PARENT_SCOPE)
+        message(STATUS "Found ONNX Runtime GenAI runtime dir: ${_flm_ort_genai_lib_dir}")
+    endif()
+endfunction()
+
+function(flm_stage_ort_genai_runtime TARGET_NAME)
+    if(WIN32)
+        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${TARGET_NAME}>"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/out")
+        foreach(_flm_runtime_dll ${ORT_GENAI_RUNTIME_DLLS})
+            add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_flm_runtime_dll}"
+                    "$<TARGET_FILE_DIR:${TARGET_NAME}>"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_flm_runtime_dll}"
+                    "${CMAKE_SOURCE_DIR}/out")
+        endforeach()
+    endif()
+endfunction()
+
 # Where the kernels come from. FastFlowLM's own flow and ryzenai-corelib share
 # no engine, so a build links one or the other; this option is not an extra.
 # It also fixes the NPU generation the build targets -- see utils/npu_platform.hpp.
@@ -222,6 +325,7 @@ include("${CMAKE_SOURCE_DIR}/common/chat/chat_sources.cmake")
 file(GLOB SOURCES "src/*.cpp" "runner/*.cpp" "common/*.cpp" "common/*/*.cpp" "server/*.cpp" "pull/*.cpp" )
 file(GLOB HEADERS "include/*.hpp" "runner/*.hpp" "common/*.hpp" "common/*/*.hpp" "server/*.hpp" "pull/*.hpp")
 list(FILTER SOURCES EXCLUDE REGEX ".*/common/core/.*\\.cpp$")
+list(FILTER SOURCES EXCLUDE REGEX ".*/hip_oga_main\\.cpp$")
 
 # Model sources live two levels deeper than the globs above reach. Only the core
 # half exists as loose sources; it is built separately, below.
@@ -265,6 +369,15 @@ endif()
 
 
 add_executable(flm ${SOURCES} ${HEADERS})
+
+if(FLM_ENABLE_HIP_OGA)
+    flm_find_ort_genai()
+    target_include_directories(flm PUBLIC "${ORT_GENAI_INCLUDE_DIR}")
+    target_compile_definitions(flm PUBLIC FLM_ENABLE_HIP_OGA=1)
+    target_link_libraries(flm PUBLIC "${ORT_GENAI_LIBRARY}")
+    flm_stage_ort_genai_runtime(flm)
+endif()
+
 
 if(FLM_ENABLE_CORE)
     include("${CMAKE_SOURCE_DIR}/common/core/core_sources.cmake")
