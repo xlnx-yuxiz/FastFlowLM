@@ -166,9 +166,10 @@
                     "hip_only": true,
                     "provider": "AMDGPU",
                     "profile": "hip",
-                    "support_status": "hybrid_gpu_experimental",
+                    "offload_policy": "strict_gpu",
+                    "legacy_alias_for": "gemma3:4b",
+                    "support_status": "experimental_verified",
                     "config_path": "hip-gemma3-4b-oga",
-                    "unsupported_reason": "The pinned public Gemma3 image requests pass strict GPU execution, but text-only requests fail image_features rank 2 versus 3 on the retained OGA runtime; private flat-feature qualification does not admit this public graph",
                     "required_files": [
                         "genai_config.json",
                         "chat_template.jinja",
@@ -217,9 +218,9 @@
                 "label": [
                     "hip",
                     "vision",
-                    "hybrid_gpu",
+                    "strict_gpu",
                     "experimental",
-                    "unqualified"
+                    "legacy"
                 ],
                 "footprint": 4.06
             }
@@ -1136,26 +1137,46 @@
                 "hip_oga": {
                     "provider": "AMDGPU",
                     "profile": "hip",
-                    "config_path": "gemma3-4b-it-rtn-int4-128gs-fp16-onnx-gpu-pruned_lm_head",
-                    "offload_policy": "hybrid_gpu",
-                    "hybrid_cpu_fallback_allowlist": [
-                        "Shape",
-                        "Reshape",
-                        "Gather",
-                        "Concat",
-                        "Slice",
-                        "Unsqueeze"
-                    ],
+                    "offload_policy": "strict_gpu",
+                    "support_status": "experimental_verified",
+                    "config_path": "hip-gemma3-4b-oga",
                     "required_files": [
                         "genai_config.json",
-                        "tokenizer.json",
-                        "tokenizer_config.json",
-                        "processor_config.json",
+                        "chat_template.jinja",
                         "embedding.onnx",
+                        "embedding.onnx.data",
                         "text.onnx",
-                        "vision.onnx"
+                        "text.onnx.data",
+                        "vision.onnx",
+                        "vision.onnx.data",
+                        "processor_config.json",
+                        "tokenizer.json",
+                        "tokenizer.model",
+                        "tokenizer_config.json"
                     ],
-                    "provider_options": {}
+                    "provider_options": {},
+                    "public_hf": {
+                        "endpoint_env": "FLM_HIP_OGA_HF_ENDPOINT",
+                        "repo_id": "amd/Gemma3-4B-it_gpuep_1.0_gpu_128",
+                        "revision": "67e57aeb12f71ec7ac94068c433d8de075653863",
+                        "source_subdir": "Upload gemma3-4b-it ONNX files",
+                        "license": "Gemma",
+                        "model_kind": "vlm",
+                        "files": [
+                            {"path": "chat_template.jinja", "sha256": "e0a1e0983c75b0198f1045cbb20c64506a9ffb30925bd44feba0b91acf2d4f43", "size": 1579},
+                            {"path": "embedding.onnx", "sha256": "f082b0ede468b6528aa93e4550cad0a958574b4ba015fc5a8ca6a98bb6ccdeff", "size": 4328},
+                            {"path": "embedding.onnx.data", "sha256": "1fecd829d21c8cbf2f4022121119625143b3a0fef27d307c3495baf9881a5a0b", "size": 1342504960},
+                            {"path": "genai_config.json", "sha256": "c280f4e1b883ac5f2dd031392af8f05e97cb64e6e8926a517c24b79a8089386d", "size": 3263},
+                            {"path": "processor_config.json", "sha256": "262e46e97a0bdfcae65e6d7cc8e61942759d7e453c1dc29875d361aac2283a8d", "size": 1276},
+                            {"path": "text.onnx", "sha256": "5e71d480ca975c9af659b5d0f510c42066db2842e4277a9e67d2e969c43582bc", "size": 557551},
+                            {"path": "text.onnx.data", "sha256": "887cb518d8a01e3908839657aeedca2229d3babc8dbb35bd98dd52db86e5a238", "size": 2136358912},
+                            {"path": "tokenizer.json", "sha256": "4667f2089529e8e7657cfb6d1c19910ae71ff5f28aa7ab2ff2763330affad795", "size": 33384568},
+                            {"path": "tokenizer.model", "sha256": "1299c11d7cf632ef3b4e11937501358ada021bbdf7c47638d13c0ee982f2e79c", "size": 4689074},
+                            {"path": "tokenizer_config.json", "sha256": "aaa2fcda21223a29048958bf66b835716c5da0ba9739f8ceb73897a0825b1344", "size": 1206707},
+                            {"path": "vision.onnx", "sha256": "dcf77a07c1780e21f3072b320d24e474bbf15cfcbba296b06d9e46db6813640b", "size": 749730},
+                            {"path": "vision.onnx.data", "sha256": "6a9f7d41e8d0c3ef54a535d736fffe34f75332d3ef40bf1adb031ca2969a0109", "size": 839886047}
+                        ]
+                    }
                 },
                 "footprint": 4.5
             }

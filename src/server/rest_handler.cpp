@@ -12,6 +12,7 @@
 #include "chat/auto_tools.hpp"
 #include "backend_options.hpp"
 #include "hip_oga_policy.hpp"
+#include "hip_oga_ensure_model.hpp"
 #include "AutoModel/hip_oga_sampling.hpp"
 #include "AutoModel/hip_oga_errors.hpp"
 #include "wstream_buf.hpp"
@@ -563,7 +564,7 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
             auto [new_ensure_tag, selected_model_info] =
                 supported_models.get_model_info(ensure_tag);
             model_info = std::move(selected_model_info);
-            model_path = supported_models.get_hip_oga_model_path(new_ensure_tag);
+            model_path = flm::hip_oga::ensure_hip_oga_model(supported_models, new_ensure_tag);
             model_info["hip_oga"]["config_path"] = model_path;
         } else {
             std::pair<std::string, std::unique_ptr<AutoModel>> auto_model =

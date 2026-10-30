@@ -13,6 +13,7 @@
 #include "chat/chat_output.hpp"
 #include "harmony_filter.hpp"
 #include "hip_oga_policy.hpp"
+#include "hip_oga_ensure_model.hpp"
 #include "AutoModel/hip_oga_sampling.hpp"
 #ifndef FASTFLOWLM_LINUX_LIMITED_MODELS
 #include "AutoEmbeddingModel/all_embedding_model.hpp"
@@ -109,7 +110,7 @@ Runner::Runner(model_list& supported_models, ModelDownloader& downloader, progra
 
         auto [new_tag, selected_model_info] = this->supported_models.get_model_info(this->tag);
         model_info = std::move(selected_model_info);
-        model_path = this->supported_models.get_hip_oga_model_path(new_tag);
+        model_path = flm::hip_oga::ensure_hip_oga_model(this->supported_models, new_tag);
         model_info["hip_oga"]["config_path"] = model_path;
     } else {
         std::pair<std::string, std::unique_ptr<AutoModel>> auto_model =
@@ -657,7 +658,7 @@ void Runner::cmd_load(std::vector<std::string>& input_list) {
         } else if (using_hip_oga) {
             auto [new_tag, selected_model_info] = this->supported_models.get_model_info(this->tag);
             model_info = std::move(selected_model_info);
-            model_path = this->supported_models.get_hip_oga_model_path(new_tag);
+            model_path = flm::hip_oga::ensure_hip_oga_model(this->supported_models, new_tag);
             model_info["hip_oga"]["config_path"] = model_path;
         } else {
             auto [new_tag, selected_model_info] = this->supported_models.get_model_info(this->tag);

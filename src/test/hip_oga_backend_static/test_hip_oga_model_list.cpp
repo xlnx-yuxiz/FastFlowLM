@@ -96,6 +96,25 @@ int main(int argc, char** argv) {
         }
       }
     },
+    "hip-alias": {
+      "1b": {
+        "name": "Hip-Alias-1B-OGA",
+        "files": [],
+        "default_context_length": 4096,
+        "max_prefill_len": 4096,
+        "details": {"family": "llama3", "parameter_size": "1B", "quantization_level": "OGA"},
+        "hip_oga": {
+          "hip_only": true,
+          "legacy_alias_for": "llama3.2:1b",
+          "provider": "AMDGPU",
+          "profile": "hip",
+          "config_path": "llama3.2-1b-oga",
+          "offload_policy": "strict_gpu",
+          "required_files": ["genai_config.json", "tokenizer.json", "tokenizer_config.json"],
+          "provider_options": {}
+        }
+      }
+    },
     "llama3.2": {
       "1b": {
         "name": "Llama-3.2-1B-NPU2",
@@ -277,6 +296,9 @@ int main(int argc, char** argv) {
         bool saw_unqualified = false;
         bool saw_uninstalled_hip_only_model = false;
         for (const auto& hip_model : hip_models["models"]) {
+            if (hip_model["model"] == "hip-alias:1b") {
+                throw std::runtime_error("legacy HIP alias must be hidden from list output");
+            }
             if (hip_model["backend"] != "hip") {
                 throw std::runtime_error("HIP OGA list entry did not expose backend status");
             }

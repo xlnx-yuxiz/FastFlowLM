@@ -141,7 +141,7 @@ class model_list {
 
         /// \brief get the model root path
         /// \return the model root path, string
-        std::string get_model_root_path(){
+        std::string get_model_root_path() const {
             return this->model_root_path;
         }
 
@@ -175,6 +175,8 @@ class model_list {
                 for (const auto& [size, model_info] : model_subset.items()) {
                     const std::string tag = model_type + ":" + size;
                     if (!has_hip_oga_model_path(tag)) continue;
+                    const auto& hip_options = model_info["hip_oga"];
+                    if (hip_options.contains("legacy_alias_for")) continue;
 
                     nlohmann::json model_entry = model_info;
                     model_entry["name"] = tag;

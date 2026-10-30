@@ -244,6 +244,8 @@ def run_pull(
     expected: str,
     *,
     force: bool = False,
+    default_root: bool = False,
+    ensure: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
         str(binary),
@@ -255,6 +257,10 @@ def run_pull(
     ]
     if force:
         cmd.append("force")
+    if default_root:
+        cmd.append("default-root")
+    if ensure:
+        cmd.append("ensure")
     completed = subprocess.run(
         cmd, cwd=ROOT, check=False, capture_output=True, text=True
     )
@@ -292,7 +298,8 @@ def run_case(
     case_root = tmp / name
     public_root = case_root / "hf"
     config_dir = case_root / "config"
-    install_root = case_root / "install"
+    default_root = name in {"default_model_root", "ensure_default_model_root"}
+    install_root = case_root / ("models" if default_root else "install")
     fail_once, corrupt_once, expected, force = setup(
         public_root, config_dir, install_root
     )
@@ -308,6 +315,8 @@ def run_case(
             install_root,
             expected,
             force=force,
+            default_root=default_root,
+            ensure=name == "ensure_default_model_root",
         )
     if name == "endpoint_userinfo_rejected":
         output = completed.stdout + completed.stderr
@@ -592,6 +601,8 @@ def main() -> None:
 
         cases = [
             ("success", setup_success),
+            ("default_model_root", setup_success),
+            ("ensure_default_model_root", setup_success),
             ("retry_success", setup_retry_success),
             ("checksum_mismatch_cleanup", setup_checksum_mismatch),
             ("non_amd_repo", setup_non_amd_repo),

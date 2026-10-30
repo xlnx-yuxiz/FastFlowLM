@@ -300,8 +300,8 @@ for model_type, model_subset in model_list_json["models"].items():
         if "vision" not in model.get("label", []):
             continue
         hip_vlm_policies.append(model["hip_oga"].get("offload_policy", "unqualified"))
-require("hybrid_gpu" in hip_vlm_policies,
-        "HIP OGA catalog must include an explicitly labeled hybrid_gpu VLM package")
+require("strict_gpu" in hip_vlm_policies,
+        "HIP OGA catalog must include an explicitly labeled strict_gpu VLM package")
 required_files = set(llama32_1b["hip_oga"].get("required_files", []))
 for required_file in ("genai_config.json", "tokenizer.json", "tokenizer_config.json"):
     require(required_file in required_files,
@@ -341,10 +341,10 @@ expected_public_tags = {
         "repo_id": "amd/Gemma3-4B-it_gpuep_1.0_gpu_128",
         "revision": "67e57aeb12f71ec7ac94068c433d8de075653863",
         "model_kind": "vlm",
-        "unsupported": True,
+        "unsupported": False,
         "size": 4359347995,
-        "support_status": "hybrid_gpu_experimental",
-        "labels": {"hip", "vision", "hybrid_gpu", "experimental", "unqualified"},
+        "support_status": "experimental_verified",
+        "labels": {"hip", "vision", "strict_gpu", "experimental", "legacy"},
         "source_subdir": "Upload gemma3-4b-it ONNX files",
     },
     "hip-qwen3.5-vl:9b": {
@@ -414,6 +414,15 @@ for tag, expected in expected_public_tags.items():
         require("unsupported_reason" not in hip_oga,
                 f"{tag} text trial entry must not be marked unsupported")
 
+canonical_gemma = model_list_json["models"]["gemma3"]["4b"]
+legacy_gemma = model_list_json["models"]["hip-gemma3"]["4b"]
+require("model.q4nx" in canonical_gemma["files"],
+        "canonical Gemma must retain its NPU package")
+require(canonical_gemma["hip_oga"]["public_hf"] == legacy_gemma["hip_oga"]["public_hf"] and
+        canonical_gemma["hip_oga"]["config_path"] == legacy_gemma["hip_oga"]["config_path"] and
+        legacy_gemma["hip_oga"].get("legacy_alias_for") == "gemma3:4b",
+        "canonical and legacy HIP Gemma tags must resolve to one pinned package")
+
 require("validate_hip_oga_package" in model_list_hpp,
         "model_list does not validate the HIP OGA package contract for tag loads")
 for token in ("tokenizer_config.json", "eos_token", "eos_token_id", "chat_template.jinja", "chat_template"):
@@ -430,8 +439,8 @@ require("hip_oga_requested_max_tokens" in runner,
         "Runner must pass the requested max token budget before HIP OGA insert")
 require("HipOgaModel::model_info_for_path(this->tag)" in runner,
         "Runner does not load direct OGA model directories through HipOgaModel")
-require("this->supported_models.get_hip_oga_model_path(new_tag)" in runner,
-        "Runner does not resolve HIP model-list tags to OGA package paths")
+require("ensure_hip_oga_model(this->supported_models, new_tag)" in runner,
+        "Runner must ensure admitted HIP model-list packages before loading")
 require("model_info[\"hip_oga\"][\"config_path\"] = model_path" in runner,
         "Runner does not pass the resolved HIP OGA package path into model metadata")
 require("report_hip_oga_offload_policy" in runner,
@@ -445,8 +454,8 @@ require("request.value(\"backend\"" in rest_handler, "REST handlers do not accep
 require("current_backend != resolved_backend" in rest_handler, "REST handler does not reload when backend changes")
 require("HipOgaModel::model_info_for_path(ensure_tag)" in rest_handler,
         "REST handler does not load direct OGA model directories through HipOgaModel")
-require("supported_models.get_hip_oga_model_path(new_ensure_tag)" in rest_handler,
-        "REST handler does not resolve HIP model-list tags to OGA package paths")
+require("ensure_hip_oga_model(supported_models, new_ensure_tag)" in rest_handler,
+        "REST handler must ensure admitted HIP model-list packages before loading")
 require("report_hip_oga_offload_policy" in rest_handler,
         "REST handler must report selected HIP OGA offload policy before load")
 require("get_all_models_openai_hip_oga(direct_model_path)" in rest_handler,

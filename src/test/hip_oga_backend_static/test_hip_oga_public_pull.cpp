@@ -1,6 +1,7 @@
 /// \file test_hip_oga_public_pull.cpp
 /// \brief Runtime check for public AMD Hugging Face HIP OGA catalog installation
 #include "hip_oga_public_downloader.hpp"
+#include "hip_oga_ensure_model.hpp"
 
 #include <cstdlib>
 #include <filesystem>
@@ -44,7 +45,7 @@ bool has_temp_install_dirs(const std::filesystem::path& install_root) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc < 6 || argc > 7) {
+        if (argc < 6 || argc > 9) {
             throw std::runtime_error(
                 "usage: test_hip_oga_public_pull <model_list> <exe_dir> <endpoint> <install_root> <success|failure> [force]");
         }
@@ -54,21 +55,38 @@ int main(int argc, char** argv) {
         const std::string endpoint = argv[3];
         const std::filesystem::path install_root = argv[4];
         const std::string expected_result = argv[5];
-        const bool force = argc == 7 && std::string(argv[6]) == "force";
+        bool force = false;
+        bool default_root = false;
+        bool ensure = false;
+        for (int i = 6; i < argc; ++i) {
+            force = force || std::string(argv[i]) == "force";
+            default_root = default_root || std::string(argv[i]) == "default-root";
+            ensure = ensure || std::string(argv[i]) == "ensure";
+        }
         const std::filesystem::path installed_model =
             install_root / "test-oga";
 
         set_env("FLM_HIP_OGA_HF_ENDPOINT", endpoint);
         set_env("FLM_HIP_OGA_SECRET_ENDPOINT", endpoint);
         set_env("AWS_SECRET_ACCESS_KEY", endpoint);
-        set_env("FLM_HIP_OGA_MODEL_ROOT", install_root.string());
+        set_env("FLM_HIP_OGA_MODEL_ROOT", default_root ? "" : install_root.string());
 
         std::string list_path = model_list_path.string();
         std::string exe_dir_string = exe_dir;
         model_list models(list_path, exe_dir_string);
         flm::hip_oga::PublicHfDownloader downloader(models);
 
-        const bool success = downloader.pull("hip-test:1b", force);
+        bool success = false;
+        if (ensure) {
+            try {
+                success = flm::hip_oga::ensure_hip_oga_model(models, "hip-test:1b") ==
+                    installed_model.string();
+            } catch (const std::exception&) {
+                success = false;
+            }
+        } else {
+            success = downloader.pull("hip-test:1b", force);
+        }
         if (expected_result == "failure") {
             if (success) {
                 throw std::runtime_error("expected HIP OGA public pull to fail");

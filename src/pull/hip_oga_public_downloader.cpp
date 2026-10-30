@@ -679,7 +679,7 @@ void reject_symlinked_existing_components(
 }
 
 std::filesystem::path ensure_install_path_under_root(
-    const nlohmann::json& options,
+    const model_list& models, const nlohmann::json& options,
     const std::string& tag, bool create_root = true) {
     const auto configured_path = options.find("config_path");
     if (configured_path == options.end() || !configured_path->is_string()) {
@@ -690,11 +690,9 @@ std::filesystem::path ensure_install_path_under_root(
     const std::string relative_config_path =
         validate_relative_path(configured_path->get<std::string>(),
                                "hip_oga.config_path");
-    const std::string root = getenv_string("FLM_HIP_OGA_MODEL_ROOT");
-    if (root.empty()) {
-        throw std::runtime_error(
-            "Backend 'hip' pull needs FLM_HIP_OGA_MODEL_ROOT so auto-pull cannot target an arbitrary path");
-    }
+    const std::string override_root = getenv_string("FLM_HIP_OGA_MODEL_ROOT");
+    const std::string root = override_root.empty()
+        ? models.get_model_root_path() : override_root;
     const std::filesystem::path root_input =
         std::filesystem::absolute(std::filesystem::path(root)).lexically_normal();
     if (create_root) std::filesystem::create_directories(root_input);
@@ -925,7 +923,7 @@ bool PublicHfDownloader::remove(const std::string& model_tag) {
         const auto options = supported_models_.get_hip_oga_model_options(model_tag);
         const auto public_hf = supported_models_.get_hip_oga_public_hf_config(model_tag);
         const auto files = validated_manifest(public_hf, options);
-        const auto path = ensure_install_path_under_root(options, model_tag, false);
+        const auto path = ensure_install_path_under_root(supported_models_, options, model_tag, false);
         if (!std::filesystem::exists(path)) {
             header_print("FLM", "HIP OGA package already absent: " << path.string());
             return true;
@@ -981,7 +979,7 @@ bool PublicHfDownloader::pull(const std::string& model_tag, bool force_redownloa
         ensure_file_entries_cover_required_files(files, options);
 
         const std::filesystem::path install_path =
-            ensure_install_path_under_root(options, resolved_tag);
+            ensure_install_path_under_root(supported_models_, options, resolved_tag);
         if (std::filesystem::exists(install_path) && !force_redownload) {
             try {
                 supported_models_.validate_hip_oga_model_path_for_tag(
